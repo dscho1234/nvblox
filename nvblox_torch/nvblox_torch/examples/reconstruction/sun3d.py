@@ -22,7 +22,7 @@ from nvblox_torch.mapper import Mapper
 from nvblox_torch.mapper_params import MapperParams, ProjectiveIntegratorParams
 from nvblox_torch.examples.utils.visualization import Visualizer
 from nvblox_torch.examples.utils.feature_extraction import RadioFeatureExtractor
-
+import time
 # How often to integrate deep features.
 INTEGRATE_DEEP_FEATURES_EVERY_N_FRAMES = 20
 
@@ -153,8 +153,10 @@ def main() -> int:
     # Process frames
     print('Press space-bar to pause/resume the visualization.')
     for idx, data in enumerate(dataloader):
-        print(f'Integrating frame: {idx}')
+        start = time.time()
         process_frame(idx, mapper, data, feature_extractor, visualizer)
+        print(f'Integrating frame: {idx}')
+        print('process frame time: ', time.time() - start)
 
         if args.num_frames and idx > args.num_frames:
             break

@@ -60,3 +60,6 @@ nvblox_torch/dist
 
 # Generated version file
 nvblox_torch/nvblox_torch/_version.py
+
+sun3d*
+visibility_test_output/
