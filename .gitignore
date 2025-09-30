@@ -64,3 +64,4 @@ nvblox_torch/nvblox_torch/_version.py
 sun3d*
 visibility_test_output*/
 robot_transform_debug/
+test_urdf_mesh/
