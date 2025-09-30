@@ -26,6 +26,7 @@ from nvblox_torch.mapper import Mapper, QueryType
 from nvblox_torch.mapper_params import MapperParams, ProjectiveIntegratorParams
 from nvblox_torch.mesh import ColorMesh
 from nvblox_torch.projective_integrator_types import ProjectiveIntegratorType
+from nvblox_torch.constants import constants
 
 
 # ========= 사용자 설정 =========
@@ -34,11 +35,11 @@ BUFFER_PATH = "/home/dscho-larr/fast_storage/dscho/im2flow2act/data/realworld_hu
 EPISODE_IDX = 0
 FRAME_IDX = 100  # 특정 프레임 선택
 DEPTH_SCALE = 0.001        # 깊이 단위 → 미터 변환 (예: mm면 0.001, 이미 m면 1.0)
-OFFSET_DISTANCE = 0.05 # for convex part of the constructed mesh
+OFFSET_DISTANCE = 0.0 # for convex part of the constructed mesh
 
 # TSDF 설정
 # Mesh 품질 선택: "high_resolution" (5mm), "medium_resolution" (10mm), "low_resolution" (20mm)
-MESH_QUALITY = "medium_resolution" # "medium_resolution"  # "high_resolution", "medium_resolution", "low_resolution"
+MESH_QUALITY = "low_resolution" # "medium_resolution"  # "high_resolution", "medium_resolution", "low_resolution"
 
 if MESH_QUALITY == "high_resolution":
     VOXEL_SIZE = 0.005  # 5mm - 높은 해상도, 조각난 mesh
@@ -300,10 +301,10 @@ def pick_query_pixel(depth_m):
     return int(xs[i]), int(ys[i])
 
 
-# ========= nvblox 기반 메시 생성 =========
-def create_mesh_with_nvblox(depth_image, rgb_image, K, voxel_size=0.005, max_integration_distance=5.0, return_mapper=False, mapper=None):
+
+def create_mapper_with_nvblox(depth_image, rgb_image, K, voxel_size=0.005, max_integration_distance=5.0, mapper=None):
     """
-    nvblox를 사용하여 3D 메시 생성
+    nvblox를 사용하여 mapper만 생성 (mesh 없이)
     
     Args:
         depth_image: (H, W) 깊이 이미지 (미터)
@@ -311,202 +312,810 @@ def create_mesh_with_nvblox(depth_image, rgb_image, K, voxel_size=0.005, max_int
         K: (3, 3) 카메라 내부 파라미터
         voxel_size: voxel 크기 (미터)
         max_integration_distance: 최대 통합 거리 (미터)
-        return_mapper: True면 (mesh, mapper) 튜플 반환, False면 mesh만 반환
         mapper: 기존 Mapper 객체 재사용 (None이면 새로 생성)
     
     Returns:
-        mesh: nvblox ColorMesh 객체 또는 (mesh, mapper) 튜플
+        mapper: nvblox Mapper 객체
     """
-    print("Creating mesh with nvblox...")
+    print("Creating mapper with nvblox...")
     start = time.time()
     # 데이터를 torch tensor로 변환
     H, W = depth_image.shape
-    
-    # Depth 이미지를 torch tensor로 변환 (GPU)
+
+    # Depth 이미지를 torch tensor로 변환
     depth_tensor = torch.from_numpy(depth_image.astype(np.float32)).cuda()
     
-    # RGB 이미지를 torch tensor로 변환 (GPU, uint8)
-    rgb_tensor = torch.from_numpy((rgb_image * 255).astype(np.uint8)).cuda()
+    # RGB 이미지를 torch tensor로 변환 (H, W, 3)
+    rgb_tensor = torch.from_numpy(rgb_image).cuda()
     
-    # 카메라 내부 파라미터를 torch tensor로 변환 (CPU)
-    intrinsics_tensor = torch.from_numpy(K.astype(np.float32)).cpu()
+    # 카메라 내부 파라미터를 torch tensor로 변환
+    K_tensor = torch.from_numpy(K).float().cpu()
     
-    # 카메라 포즈 (identity matrix, CPU)
-    pose_tensor = torch.eye(4, dtype=torch.float32).cpu()
+    # 카메라 pose (identity)
+    pose_tensor = torch.eye(4).float().cpu()
     
-    # Mapper 재사용 또는 새로 생성
+    # Mapper 생성 또는 재사용
     if mapper is None:
-        # nvblox Mapper 설정
-        projective_integrator_params = ProjectiveIntegratorParams()
-        projective_integrator_params.projective_integrator_max_integration_distance_m = max_integration_distance
-        mapper_params = MapperParams()
-        mapper_params.set_projective_integrator_params(projective_integrator_params)
-        
-        # Mapper 생성
-        mapper = Mapper(
-            voxel_sizes_m=voxel_size,
-            # integrator_types=ProjectiveIntegratorType.TSDF,
-            mapper_parameters=mapper_params
-        )
+        mapper = Mapper(voxel_sizes_m=voxel_size)
     
+    # TSDF layer에 depth frame 추가
+    mapper.add_depth_frame(depth_tensor, pose_tensor, K_tensor)
     
-    # 데이터 통합
-    mapper.add_depth_frame(depth_tensor, pose_tensor, intrinsics_tensor)
-    mapper.add_color_frame(rgb_tensor, pose_tensor, intrinsics_tensor)
+    # Color layer에 RGB frame 추가
+    mapper.add_color_frame(rgb_tensor, pose_tensor, K_tensor)
     
     # 메시 업데이트
     mapper.update_color_mesh()
-    
-    # 메시 가져오기
-    color_mesh = mapper.get_color_mesh()
-    
-    print(f"nvblox mesh created with {color_mesh.vertices().shape[0]} vertices and {color_mesh.triangles().shape[0]} triangles")
-    print('color mesh update time: ', time.time() - start)
-    
-    
-    if return_mapper:
-        return color_mesh, mapper
-    else:
-        return color_mesh
 
-
+    # ESDF layer 업데이트 (TSDF 기반으로 ESDF 생성)
+    mapper.update_esdf()
+    
+    print(f"nvblox mapper created in {time.time() - start:.4f} seconds")
+    
+    return mapper
 
 
 # ========= nvblox ESDF 기반 Visibility 체크 =========
-def nvblox_mesh_to_open3d(nvblox_mesh):
+def check_visibility_with_esdf_ray_marching(mapper, origin, target_point, max_distance, num_samples=100):
     """
-    nvblox ColorMesh를 Open3D TriangleMesh로 변환
+    ESDF layer를 사용한 ray marching으로 visibility 체크
     
     Args:
-        nvblox_mesh: nvblox ColorMesh 객체
+        mapper: nvblox Mapper 객체
+        origin: 레이 시작점 (월드 좌표)
+        target_point: 목표 점 (월드 좌표)
+        max_distance: 최대 거리
+        num_samples: ray marching 샘플 수
+        mapper_id: mapper ID
     
     Returns:
-        o3d.geometry.TriangleMesh: Open3D 메시 객체
+        (visible, hit_distance, hit_point)
+        - visible: True if point is visible
+        - hit_distance: distance to first hit (if any)
+        - hit_point: hit point coordinates (if any)
     """
-    
-    # # nvblox mesh에서 vertices와 triangles 추출
-    # vertices = nvblox_mesh.vertices().cpu().numpy()
-    # triangles = nvblox_mesh.triangles().cpu().numpy()
-    
-    # if len(vertices) == 0 or len(triangles) == 0:
-    #     return None
-    
-    # # Open3D 메시 생성
-    # mesh = o3d.geometry.TriangleMesh()
-    # mesh.vertices = o3d.utility.Vector3dVector(vertices)
-    # mesh.triangles = o3d.utility.Vector3iVector(triangles)
-    
-    # # 법선 계산 (raycasting에 필요)
-    # mesh.compute_vertex_normals()
-
-
-    # dscho debug
-    mesh = nvblox_mesh.to_open3d()
-    
-    return mesh
-    
-
-
-
-
-
-    
-    
-
-
-
-
-
-
-def create_raycasting_scene(mesh):
-    """
-    nvblox mesh로부터 Open3D RaycastingScene을 미리 생성
-    
-    Args:
-        mesh: nvblox ColorMesh 객체
-    
-    Returns:
-        scene: o3d.t.geometry.RaycastingScene 객체
-    """
-    print("    Creating raycasting scene...")
     start_time = time.time()
     
-    # 1. nvblox mesh를 Open3D로 변환
-    open3d_mesh = nvblox_mesh_to_open3d(mesh)
+    # 방향 벡터 계산
+    direction = target_point - origin
+    distance = np.linalg.norm(direction)
+    if distance == 0:
+        return True, 0, None
     
-    if open3d_mesh is None:
-        print("    Failed to convert mesh, returning None")
-        return None
+    direction = direction / distance
     
-    # 2. 메시를 tensor로 변환
-    mesh_tensor = o3d.t.geometry.TriangleMesh.from_legacy(open3d_mesh)
+    # Ray marching을 위한 샘플 포인트들 생성
+    sample_distances = np.linspace(0, min(distance, max_distance), num_samples)
+    sample_points = origin + direction.reshape(1, 3) * sample_distances.reshape(-1, 1)
     
-    # 3. Ray casting scene 생성
-    scene = o3d.t.geometry.RaycastingScene()
-    scene.add_triangles(mesh_tensor)
+    # ESDF layer에서 distance 값들 쿼리
+    sample_points_tensor = torch.from_numpy(sample_points.astype(np.float32)).cuda()
+    
+    # ESDF 쿼리 수행
+    esdf_results = mapper.query_differentiable_layer(
+        query_type=QueryType.ESDF,
+        query=sample_points_tensor
+    )
+    
+    # ESDF 결과에서 distance 추출
+    esdf_distances = esdf_results.cpu().numpy()  # [num_samples]
+    
+    # Visibility 판단 로직
+    # ESDF distance < 0이면 물체 내부, distance > 0이면 물체 외부
+    # Ray가 물체에 부딪히는 첫 번째 지점을 찾음
+    hit_mask = (esdf_distances < 0)  # ESDF는 음수면 물체 내부
+    
+    if np.any(hit_mask):
+        # 첫 번째 hit 지점 찾기
+        first_hit_idx = np.argmax(hit_mask)
+        hit_distance = sample_distances[first_hit_idx]
+        hit_point = sample_points[first_hit_idx]
+        
+        # Hit point가 target point보다 가까우면 occluded
+        if hit_distance < distance - 0.01:  # 작은 tolerance
+            visible = False
+        else:
+            visible = True
+            hit_distance = distance
+            hit_point = target_point
+    else:
+        # Hit이 없으면 visible
+        visible = True
+        hit_distance = distance
+        hit_point = target_point
     
     end_time = time.time()
-    print(f"    Scene creation time: {end_time - start_time:.4f}s")
+    print(f"    ESDF ray marching visibility check: {end_time - start_time:.4f}s")
     
-    return scene
+    return visible, hit_distance, hit_point
 
 
-def batch_raycasting_with_scene(scene, origins, directions, max_distances):
+def batch_esdf_visibility_check(mapper, origins, target_point, max_distances, num_samples=100):
     """
-    미리 생성된 Open3D RaycastingScene을 사용한 batch raycasting
+    ESDF layer를 사용한 batch visibility 체크
     
     Args:
-        scene: 미리 생성된 o3d.t.geometry.RaycastingScene 객체
+        mapper: nvblox Mapper 객체
         origins: 레이 시작점들 [M, 3]
-        directions: 레이 방향들 (정규화된 벡터) [M, 3]
+        target_point: 목표 점 (월드 좌표)
         max_distances: 최대 거리들 [M]
+        num_samples: ray marching 샘플 수
+        mapper_id: mapper ID
     
     Returns:
         (visible_array, hit_distances_array)
         - visible_array: [M] boolean array, True if visible
         - hit_distances_array: [M] float array, hit distances
     """
-    if scene is None:
-        print("    Scene is None, assuming all visible")
-        return np.ones(len(origins), dtype=bool), max_distances.copy()
-    
     total_start_time = time.time()
     
-    # 1. Batch ray 생성
-    step1_start = time.time()
-    rays = np.hstack([origins, directions])
-    rays_tensor = o3d.core.Tensor(rays, dtype=o3d.core.Dtype.Float32)
-    step1_time = time.time() - step1_start
-    print(f"      Step 1 - Ray preparation: {step1_time:.4f}s")
+    M = len(origins)
+    visible_array = np.zeros(M, dtype=bool)
+    hit_distances_array = np.zeros(M, dtype=np.float64)
     
-    # 2. Batch raycasting 수행
-    step2_start = time.time()
-    ans = scene.cast_rays(rays_tensor)
-    step2_time = (time.time() - step2_start)
-    print(f"      Step 2 - Ray casting: {step2_time:.4f}s")
-    
-    # 3. 결과 분석
-    step3_start = time.time()
-    hit_distances = ans['t_hit'].numpy()  # [M]
-    
-    # Visibility 판단: hit이 inf이거나 max_distance보다 크면 visible
-    visible = np.logical_or(np.isinf(hit_distances), hit_distances > max_distances)
-    
-    # Hit distance 조정: visible한 경우 max_distance로 설정
-    hit_distances_adjusted = np.where(visible, max_distances, hit_distances)
-    step3_time = time.time() - step3_start
-    print(f"      Step 3 - Result processing: {step3_time:.4f}s")
+    # 각 ray에 대해 개별적으로 처리 (batch 처리 최적화는 나중에)
+    for i in range(M):
+        visible, hit_distance, _ = check_visibility_with_esdf_ray_marching(
+            mapper, origins[i], target_point, max_distances[i], num_samples
+        )
+        visible_array[i] = visible
+        hit_distances_array[i] = hit_distance
     
     total_time = time.time() - total_start_time
-    print(f"    Batch raycasting ({len(origins)} rays): {total_time:.4f}s total")
+    print(f"    Batch ESDF visibility check ({M} rays): {total_time:.4f}s total")
     
-    # 각 단계별 시간 요약
-    print(f"      Time breakdown: rays={step1_time:.4f}s, casting={step2_time:.4f}s, processing={step3_time:.4f}s")
+    return visible_array, hit_distances_array
     
-    return visible, hit_distances_adjusted
 
 
 
+
+
+    
+    
+
+
+
+
+
+
+# 기존 mesh 기반 raycasting 함수들은 TSDF 기반 함수로 교체됨
+
+
+
+
+
+def create_ray_based_esdf_3d_visualization_plotly(mapper, query_point, candidate_viewpoints, results, save_path, 
+                                                  robot_mask=None, robot_points_original=None, robot_points_transformed=None,
+                                                  voxel_size=0.02, max_distance=1.0, num_ray_samples=50):
+    """
+    Ray 기반 ESDF 3D 시각화 생성 (RGB point cloud + ray 색상으로 ESDF 표시)
+    
+    Args:
+        mapper: nvblox Mapper 객체
+        query_point: 쿼리 포인트
+        candidate_viewpoints: 후보 viewpoint들
+        results: visibility 결과들
+        save_path: 저장 경로
+        robot_mask: 로봇 마스크
+        robot_points_original: 원본 로봇 포인트들
+        robot_points_transformed: 변환된 로봇 포인트들
+        voxel_size: ESDF 시각화용 voxel 크기
+        max_distance: 최대 거리 (미터)
+        num_ray_samples: ray당 샘플 수
+    """
+    print("Creating Ray-based ESDF 3D visualization...")
+    
+    # ESDF layer에서 거리 정보 쿼리를 위한 그리드 생성
+    def get_aabb_voxel_center_grid(layer, voxel_size_m):
+        """ESDF layer의 AABB를 커버하는 voxel center 그리드 생성"""
+        # Get the limits of the mapped space.
+        min_block_idx, max_block_idx = layer.get_block_limits()
+        aabb_min_vox = min_block_idx * layer.block_dim_in_voxels
+        aabb_max_vox = (max_block_idx + 1) * layer.block_dim_in_voxels
+        
+        # Create a 3D grid of points.
+        x_linspace = torch.linspace(aabb_min_vox[0], aabb_max_vox[0], 
+                                   aabb_max_vox[0] - aabb_min_vox[0] + 1, dtype=torch.int)
+        y_linspace = torch.linspace(aabb_min_vox[1], aabb_max_vox[1], 
+                                   aabb_max_vox[1] - aabb_min_vox[1] + 1, dtype=torch.int)
+        z_linspace = torch.linspace(aabb_min_vox[2], aabb_max_vox[2], 
+                                   aabb_max_vox[2] - aabb_min_vox[2] + 1, dtype=torch.int)
+        
+        x_grid, y_grid, z_grid = torch.meshgrid(x_linspace, y_linspace, z_linspace, indexing='ij')
+        query_grid_xyz_vox = torch.stack([x_grid, y_grid, z_grid], dim=-1)
+        
+        # Voxel units to meters.
+        query_grid_xyz_m = (query_grid_xyz_vox + 0.5) * layer.voxel_size()
+        query_grid_xyz_m = query_grid_xyz_m.cuda()
+        return query_grid_xyz_m
+    
+    # ESDF layer에서 거리 정보 쿼리
+    try:
+        # TSDF layer를 사용해서 AABB 범위를 얻음
+        tsdf_layer = mapper.tsdf_layer_view()
+        query_grid_xyz_m = get_aabb_voxel_center_grid(tsdf_layer, voxel_size)
+        
+        # ESDF 쿼리 수행
+        print(f"Querying ESDF at {query_grid_xyz_m.numel() // 3} points...")
+        sdf_values = mapper.query_differentiable_layer(
+            QueryType.ESDF, 
+            query_grid_xyz_m.reshape(-1, 3)
+        )
+        sdf_values = sdf_values.reshape(query_grid_xyz_m.shape[:-1])
+        
+        # 유효한 쿼리 마스크 생성
+        from nvblox_torch.constants import constants
+        valid_mask = torch.logical_not(sdf_values == constants.esdf_unknown_distance())
+        
+        # 거리 범위 필터링 (너무 먼 거리는 제외)
+        distance_mask = torch.abs(sdf_values) <= max_distance
+        valid_mask = valid_mask & distance_mask
+        
+        # 유효한 포인트들만 추출
+        valid_points = query_grid_xyz_m[valid_mask].cpu().numpy()
+        valid_distances = sdf_values[valid_mask].cpu().numpy()
+        
+        print(f"ESDF visualization: {len(valid_points)} valid points with distances in range [{valid_distances.min():.3f}, {valid_distances.max():.3f}]")
+        
+    except Exception as e:
+        print(f"Failed to query ESDF: {e}")
+        print("Falling back to mesh visualization...")
+        return create_3d_visualization_plotly_mesh_fallback(mapper, query_point, candidate_viewpoints, results, save_path, 
+                                                           robot_mask, robot_points_original, robot_points_transformed)
+    
+    # Plotly 시각화 생성
+    fig = go.Figure()
+    
+    # 1. ESDF 거리 필드 시각화 (voxel grid)
+    if len(valid_points) > 0:
+        # 거리 값에 따른 색상 매핑
+        import matplotlib.pyplot as plt
+        import matplotlib.colors as mcolors
+        
+        # 거리 범위 정규화 (-max_distance ~ +max_distance)
+        normalized_distances = (valid_distances + max_distance) / (2 * max_distance)
+        normalized_distances = np.clip(normalized_distances, 0, 1)
+        
+        # 색상 맵 생성 (음수=빨간색, 0=노란색, 양수=파란색)
+        colors = []
+        for dist in normalized_distances:
+            if dist < 0.5:  # 음수 거리 (물체 내부)
+                # 빨간색에서 노란색으로
+                r = 1.0
+                g = dist * 2
+                b = 0.0
+            else:  # 양수 거리 (물체 외부)
+                # 노란색에서 파란색으로
+                r = 2.0 - dist * 2
+                g = 2.0 - dist * 2
+                b = (dist - 0.5) * 2
+            
+            colors.append(f'rgb({int(r*255)},{int(g*255)},{int(b*255)})')
+        
+        # ESDF voxel grid 시각화
+        fig.add_trace(go.Scatter3d(
+            x=valid_points[:, 0],
+            y=valid_points[:, 1],
+            z=valid_points[:, 2],
+            mode='markers',
+            marker=dict(
+                size=3,
+                color=colors,
+                opacity=0.6,
+                line=dict(width=0)
+            ),
+            name='ESDF Distance Field',
+            showlegend=True,
+            hovertemplate='<b>ESDF Distance</b><br>' +
+                         'X: %{x:.3f}<br>' +
+                         'Y: %{y:.3f}<br>' +
+                         'Z: %{z:.3f}<br>' +
+                         'Distance: %{customdata:.3f}m<br>' +
+                         '<extra></extra>',
+            customdata=valid_distances
+        ))
+    
+    # 2. 원본 로봇 포인트들 표시 (빨간색)
+    if robot_points_original is not None and len(robot_points_original) > 0:
+        robot_original_sampled = robot_points_original[::max(1, len(robot_points_original)//1000)]  # 샘플링
+        
+        fig.add_trace(go.Scatter3d(
+            x=robot_original_sampled[:, 0],
+            y=robot_original_sampled[:, 1],
+            z=robot_original_sampled[:, 2],
+            mode='markers',
+            marker=dict(
+                size=4,
+                color='red',
+                opacity=0.7,
+                symbol='circle'
+            ),
+            name='Original Robot Points',
+            showlegend=True
+        ))
+    
+    # 3. 변환된 로봇 포인트들 표시 (주황색)
+    if robot_points_transformed is not None and len(robot_points_transformed) > 0:
+        robot_transformed_sampled = robot_points_transformed[::max(1, len(robot_points_transformed)//1000)]  # 샘플링
+        
+        fig.add_trace(go.Scatter3d(
+            x=robot_transformed_sampled[:, 0],
+            y=robot_transformed_sampled[:, 1],
+            z=robot_transformed_sampled[:, 2],
+            mode='markers',
+            marker=dict(
+                size=4,
+                color='orange',
+                opacity=0.7,
+                symbol='square'
+            ),
+            name='Transformed Robot Points',
+            showlegend=True
+        ))
+    
+    # 4. 쿼리 포인트 표시
+    fig.add_trace(go.Scatter3d(
+        x=[query_point[0]],
+        y=[query_point[1]],
+        z=[query_point[2]],
+        mode='markers',
+        marker=dict(
+            size=12,
+            color='red',
+            symbol='diamond',
+            line=dict(width=2, color='darkred')
+        ),
+        name='Query Point',
+        showlegend=True
+    ))
+    
+    # 5. 각 viewpoint와 Line of Sight 표시
+    for i, (viewpoint, result) in enumerate(zip(candidate_viewpoints, results)):
+        # Viewpoint 표시
+        viewpoint_color = 'green' if result['visible_robot'] else 'red'
+        fig.add_trace(go.Scatter3d(
+            x=[viewpoint[0]],
+            y=[viewpoint[1]],
+            z=[viewpoint[2]],
+            mode='markers',
+            marker=dict(
+                size=8,
+                color=viewpoint_color,
+                symbol='circle',
+                line=dict(width=2, color='darkgreen' if result['visible_robot'] else 'darkred')
+            ),
+            name=f'Viewpoint {i+1} ({result["visible_robot"] and "VISIBLE" or "OCCLUDED"})',
+            showlegend=True
+        ))
+        
+        # Line of Sight 표시
+        los_color = 'green' if result['visible_robot'] else 'red'
+        los_style = 'solid' if result['visible_robot'] else 'dash'
+        
+        fig.add_trace(go.Scatter3d(
+            x=[viewpoint[0], query_point[0]],
+            y=[viewpoint[1], query_point[1]],
+            z=[viewpoint[2], query_point[2]],
+            mode='lines',
+            line=dict(
+                color=los_color,
+                width=6,
+                dash=los_style
+            ),
+            name=f'LoS {i+1} ({result["visible_robot"] and "VISIBLE" or "OCCLUDED"})',
+            showlegend=True
+        ))
+    
+    # 레이아웃 설정
+    fig.update_layout(
+        title=dict(
+            text='ESDF-based 3D Distance Field Visualization',
+            x=0.5,
+            font=dict(size=18)
+        ),
+        scene=dict(
+            xaxis_title='X (m)',
+            yaxis_title='Y (m)',
+            zaxis_title='Z (m)',
+            aspectmode='data',
+            camera=dict(
+                eye=dict(x=1.5, y=1.5, z=1.5)
+            ),
+            bgcolor='lightgray'
+        ),
+        width=1400,
+        height=900,
+        margin=dict(l=0, r=0, t=80, b=0),
+        legend=dict(
+            x=0.02,
+            y=0.98,
+            bgcolor='rgba(255,255,255,0.8)',
+            bordercolor='black',
+            borderwidth=1
+        )
+    )
+    
+    # HTML 파일로 저장
+    import plotly.offline as pyo
+    pyo.plot(fig, filename=save_path, auto_open=False)
+    print(f"ESDF-based 3D visualization saved to: {save_path}")
+
+
+def create_ray_based_esdf_3d_visualization_plotly_new(mapper, query_point, candidate_viewpoints, results, save_path, 
+                                                      robot_mask=None, robot_points_original=None, robot_points_transformed=None,
+                                                      voxel_size=0.02, max_distance=1.0, num_ray_samples=50):
+    """
+    새로운 Ray 기반 ESDF 3D 시각화 생성 (RGB point cloud + ray 색상으로 ESDF 표시)
+    """
+    print("Creating NEW Ray-based ESDF 3D visualization...")
+    
+    # Plotly 3D 시각화 생성
+    fig = go.Figure()
+    
+    # 1. RGB Point Cloud 시각화 (원본 RGB 이미지 + depth로 3D point cloud 생성)
+    try:
+        print("Creating RGB point cloud from original images...")
+        
+        # 원본 이미지 로드 (전역 변수에서 가져오기)
+        # 이 부분은 메인 함수에서 전역 변수로 설정되어야 함
+        if 'rgb_image_original' in globals() and 'depth_image_original' in globals():
+            rgb_img = rgb_image_original
+            depth_img = depth_image_original
+            
+            # 원본 카메라 내부 파라미터 사용 (전역 변수에서 가져오기)
+            if 'camera_intrinsics_original' in globals():
+                K_original = camera_intrinsics_original
+                fx, fy = K_original[0, 0], K_original[1, 1]
+                cx, cy = K_original[0, 2], K_original[1, 2]
+            
+            
+            # 이미지 크기
+            img_height, img_width = rgb_img.shape[:2]
+            
+            # 3D point cloud 생성 (모든 픽셀 계산, 다운샘플링 없음)
+            points_3d = []
+            colors_3d = []
+            
+            for v in range(img_height):
+                for u in range(img_width):
+                    depth = depth_img[v, u]
+                    
+                    # 유효한 depth 값만 처리
+                    if depth > 0 and depth < 5.0:
+                        # 픽셀 좌표를 3D 좌표로 변환
+                        x = (u - cx) * depth / fx
+                        y = (v - cy) * depth / fy
+                        z = depth
+                        
+                        points_3d.append([x, y, z])
+                        
+                        # RGB 색상 (0-255 범위를 0-1로 정규화)
+                        r, g, b = rgb_img[v, u]
+                        colors_3d.append([r/255.0, g/255.0, b/255.0])
+            
+            if points_3d:
+                points_3d = np.array(points_3d)
+                colors_3d = np.array(colors_3d)
+                
+                # RGB point cloud 추가
+                fig.add_trace(go.Scatter3d(
+                    x=points_3d[:, 0],
+                    y=points_3d[:, 1],
+                    z=points_3d[:, 2],
+                    mode='markers',
+                    marker=dict(
+                        size=1,
+                        color=colors_3d,
+                        opacity=0.6
+                    ),
+                    name='RGB Point Cloud',
+                    showlegend=True
+                ))
+                print(f"RGB point cloud added: {len(points_3d)} points")
+            else:
+                print("No valid points found for RGB point cloud")
+        else:
+            print("Original RGB and depth images not available in global scope")
+            
+    except Exception as e:
+        print(f"RGB point cloud extraction failed: {e}")
+        print("Continuing without RGB point cloud...")
+    
+    # 2. Ray 기반 ESDF 시각화
+    try:
+        print("Generating ESDF-colored rays...")
+        
+        for i, (viewpoint, is_visible) in enumerate(zip(candidate_viewpoints, results)):
+            # Ray 방향 계산
+            direction = query_point - viewpoint
+            distance = np.linalg.norm(direction)
+            if distance == 0:
+                continue
+            
+            direction = direction / distance
+            
+            # Ray를 따라 샘플링
+            ray_points = []
+            ray_colors = []
+            ray_esdf_values = []  # 실제 ESDF 값 저장
+            
+            for j in range(num_ray_samples):
+                t = (j / (num_ray_samples - 1)) * distance
+                sample_point = viewpoint + t * direction
+                
+                # ESDF 쿼리
+                try:
+                    esdf_value = mapper.query_differentiable_layer(
+                        QueryType.ESDF, 
+                        torch.tensor(sample_point, dtype=torch.float32).unsqueeze(0).cuda()
+                    )[0].item()
+                    
+                    # ESDF unknown 값 처리
+                    if abs(esdf_value - constants.esdf_unknown_distance()) < 1e-6:  # ESDF unknown
+                        color = [0.0, 0.0, 0.0]  # 검은색 (unknown)
+                    else:
+                        # 유효한 ESDF 값 범위로 색상 매핑 (ray 거리 기반 정규화)
+                        # min=0, max=distance로 정규화
+                        if esdf_value < 0:  # 물체 내부 (음수)
+                            # 음수: 빨간색에서 노란색으로 (0에서 distance까지)
+                            normalized = min(1.0, -esdf_value / distance)
+                            color = [1.0, normalized, 0.0]
+                        else:  # 물체 외부 (양수)
+                            # 양수: 노란색에서 파란색으로 (0에서 distance까지)
+                            normalized = min(1.0, esdf_value / distance)
+                            color = [1.0 - normalized, 1.0 - normalized, normalized]
+                    
+                    ray_points.append(sample_point)
+                    ray_colors.append(color)
+                    ray_esdf_values.append(esdf_value)  # 실제 ESDF 값 저장
+                    
+                except:
+                    # ESDF 쿼리 실패시 중립 색상
+                    ray_points.append(sample_point)
+                    ray_colors.append([0.5, 0.5, 0.5])
+                    ray_esdf_values.append(0.0)  # 기본값
+            
+            if ray_points:
+                ray_points = np.array(ray_points)
+                ray_colors = np.array(ray_colors)
+                
+                # Ray 시각화 (선분으로)
+                for j in range(len(ray_points) - 1):
+                    fig.add_trace(go.Scatter3d(
+                        x=[ray_points[j][0], ray_points[j+1][0]],
+                        y=[ray_points[j][1], ray_points[j+1][1]],
+                        z=[ray_points[j][2], ray_points[j+1][2]],
+                        mode='lines',
+                        line=dict(
+                            color=ray_colors[j],
+                            width=4
+                        ),
+                        showlegend=False,
+                        hovertemplate=f'<b>Ray {i+1}</b><br>' +
+                                     'ESDF Distance: %{text}<br>' +
+                                     '<extra></extra>',
+                        text=[f'{ray_esdf_values[j]:.3f}m' for _ in range(2)]
+                    ))
+        
+        print("ESDF-colored rays generated successfully")
+        
+    except Exception as e:
+        print(f"Ray-based ESDF visualization failed: {e}")
+    
+    # 3. Query Point 표시
+    fig.add_trace(go.Scatter3d(
+        x=[query_point[0]],
+        y=[query_point[1]],
+        z=[query_point[2]],
+        mode='markers',
+        marker=dict(
+            size=12,
+            color='red',
+            symbol='diamond'
+        ),
+        name='Query Point',
+        hovertemplate='<b>Query Point</b><br>' +
+                     'X: %{x:.3f}<br>' +
+                     'Y: %{y:.3f}<br>' +
+                     'Z: %{z:.3f}<br>' +
+                     '<extra></extra>'
+    ))
+    
+    # 4. Robot Segmentation Mask Point Cloud 표시
+    if robot_mask is not None and robot_points_original is not None:
+        try:
+            # 원본 robot points
+            robot_points_3d = []
+            robot_colors_3d = []
+            
+            # robot_points_original이 numpy 배열인지 리스트인지 확인
+            if hasattr(robot_points_original, 'shape'):  # numpy 배열
+                for i in range(len(robot_points_original)):
+                    point = robot_points_original[i]
+                    if len(point) >= 3:  # x, y, z 좌표가 있는 경우
+                        robot_points_3d.append([point[0], point[1], point[2]])
+                        robot_colors_3d.append([1.0, 0.0, 1.0])  # 마젠타색
+            else:  # 리스트
+                for point in robot_points_original:
+                    if len(point) >= 3:  # x, y, z 좌표가 있는 경우
+                        robot_points_3d.append([point[0], point[1], point[2]])
+                        robot_colors_3d.append([1.0, 0.0, 1.0])  # 마젠타색
+            
+            if robot_points_3d:
+                fig.add_trace(go.Scatter3d(
+                    x=[p[0] for p in robot_points_3d],
+                    y=[p[1] for p in robot_points_3d],
+                    z=[p[2] for p in robot_points_3d],
+                    mode='markers',
+                    marker=dict(
+                        size=3,
+                        color=robot_colors_3d,
+                        opacity=0.7
+                    ),
+                    name='Robot Points (Original)',
+                    showlegend=True
+                ))
+                print(f"Robot Points (Original) added: {len(robot_points_3d)} points")
+        except Exception as e:
+            print(f"Robot Points (Original) visualization failed: {e}")
+    
+    # 5. SE(3) Transform된 Robot Point Cloud 표시
+    if robot_mask is not None and robot_points_transformed is not None:
+        try:
+            # 변환된 robot points
+            transformed_points_3d = []
+            transformed_colors_3d = []
+            
+            # robot_points_transformed가 numpy 배열인지 리스트인지 확인
+            if hasattr(robot_points_transformed, 'shape'):  # numpy 배열
+                for i in range(len(robot_points_transformed)):
+                    point = robot_points_transformed[i]
+                    if len(point) >= 3:  # x, y, z 좌표가 있는 경우
+                        transformed_points_3d.append([point[0], point[1], point[2]])
+                        transformed_colors_3d.append([0.0, 1.0, 1.0])  # 시안색
+            else:  # 리스트
+                for point in robot_points_transformed:
+                    if len(point) >= 3:  # x, y, z 좌표가 있는 경우
+                        transformed_points_3d.append([point[0], point[1], point[2]])
+                        transformed_colors_3d.append([0.0, 1.0, 1.0])  # 시안색
+            
+            if transformed_points_3d:
+                fig.add_trace(go.Scatter3d(
+                    x=[p[0] for p in transformed_points_3d],
+                    y=[p[1] for p in transformed_points_3d],
+                    z=[p[2] for p in transformed_points_3d],
+                    mode='markers',
+                    marker=dict(
+                        size=3,
+                        color=transformed_colors_3d,
+                        opacity=0.7
+                    ),
+                    name='Robot Points (Transformed)',
+                    showlegend=True
+                ))
+                print(f"Robot Points (Transformed) added: {len(transformed_points_3d)} points")
+        except Exception as e:
+            print(f"Robot Points (Transformed) visualization failed: {e}")
+    
+    # 6. Hitting Points 표시 (ESDF 값이 양수에서 음수로 바뀌는 지점)
+    hitting_points = []
+    try:
+        for i, (viewpoint, is_visible) in enumerate(zip(candidate_viewpoints, results)):
+            if is_visible:  # visible한 경우에만 hitting point 계산
+                direction = query_point - viewpoint
+                distance = np.linalg.norm(direction)
+                direction = direction / distance
+                
+                # ESDF 기반 hitting point 찾기
+                hit_point = None
+                prev_esdf_value = None
+                
+                for j in range(num_ray_samples):
+                    t = (j / (num_ray_samples - 1)) * distance
+                    sample_point = viewpoint + t * direction
+                    
+                    try:
+                        esdf_value = mapper.query_differentiable_layer(
+                            QueryType.ESDF, 
+                            torch.tensor(sample_point, dtype=torch.float32).unsqueeze(0).cuda()
+                        )[0].item()
+                        
+                        # ESDF unknown 값이 아닌 경우에만 처리
+                        if abs(esdf_value - constants.esdf_unknown_distance()) > 1e-6:
+                            if prev_esdf_value is not None:
+                                # 양수에서 음수로 바뀌는 지점 찾기
+                                if prev_esdf_value > 0 and esdf_value < 0:
+                                    hit_point = sample_point
+                                    break
+                            prev_esdf_value = esdf_value
+                    except:
+                        continue
+                
+                if hit_point is not None:
+                    hitting_points.append(hit_point)
+    except Exception as e:
+        print(f"Hitting points calculation failed: {e}")
+        hitting_points = []
+    
+    if hitting_points:
+        fig.add_trace(go.Scatter3d(
+            x=[p[0] for p in hitting_points],
+            y=[p[1] for p in hitting_points],
+            z=[p[2] for p in hitting_points],
+            mode='markers',
+            marker=dict(
+                size=6,
+                color='orange',
+                symbol='diamond'
+            ),
+            name='Hitting Points',
+            showlegend=True
+        ))
+    
+    # 4. Viewpoints 표시
+    for i, (viewpoint, is_visible) in enumerate(zip(candidate_viewpoints, results)):
+        viewpoint_color = 'green' if is_visible else 'red'
+        fig.add_trace(go.Scatter3d(
+            x=[viewpoint[0]],
+            y=[viewpoint[1]],
+            z=[viewpoint[2]],
+            mode='markers',
+            marker=dict(
+                size=8,
+                color=viewpoint_color,
+                symbol='circle'
+            ),
+            name=f'Viewpoint {i+1} ({is_visible and "VISIBLE" or "OCCLUDED"})',
+            showlegend=True
+        ))
+    
+    # 레이아웃 설정
+    fig.update_layout(
+        title=dict(
+            text='Ray-based ESDF 3D Visualization',
+            x=0.5,
+            font=dict(size=18)
+        ),
+        scene=dict(
+            xaxis_title='X (m)',
+            yaxis_title='Y (m)',
+            zaxis_title='Z (m)',
+            aspectmode='data',
+            camera=dict(
+                eye=dict(x=1.5, y=1.5, z=1.5)
+            ),
+            bgcolor='lightgray'
+        ),
+        width=1400,
+        height=900,
+        margin=dict(l=0, r=0, t=80, b=0),
+        legend=dict(
+            x=0.02,
+            y=0.98,
+            bgcolor='rgba(255,255,255,0.8)',
+            bordercolor='black',
+            borderwidth=1
+        )
+    )
+    
+    # HTML 파일로 저장
+    import plotly.offline as pyo
+    pyo.plot(fig, filename=save_path, auto_open=False)
+    print(f"Ray-based ESDF 3D visualization saved to: {save_path}")
+
+
+def create_3d_visualization_plotly_mesh_fallback(mapper, query_point, candidate_viewpoints, results, save_path, 
+                                                robot_mask=None, robot_points_original=None, robot_points_transformed=None):
+    """
+    ESDF 쿼리 실패시 mesh 기반 fallback 시각화
+    """
+    print("Using mesh-based fallback visualization...")
+    
+    # 기존 mesh 기반 시각화 함수 호출
+    mesh = mapper.get_color_mesh()
+    return create_3d_visualization_plotly(mesh, query_point, candidate_viewpoints, results, save_path, 
+                                         robot_mask, robot_points_original, robot_points_transformed)
 
 
 def create_3d_visualization_plotly(mesh, query_point, candidate_viewpoints, results, save_path, 
@@ -947,6 +1556,176 @@ def create_3d_visualization_plotly(mesh, query_point, candidate_viewpoints, resu
 
 
 
+def create_esdf_multi_viewpoint_set_3d_visualization(mappers, query_point, viewpoint_matrix, visibility_results, final_rewards, save_path, voxel_size=0.02, max_distance=1.0):
+    """
+    M개의 viewpoint set을 모두 보여주는 ESDF 기반 3D 시각화
+    
+    Args:
+        mappers: L개의 mapper 리스트
+        query_point: 쿼리 포인트
+        viewpoint_matrix: [M, L, 3] 모양의 viewpoint 매트릭스
+        visibility_results: [M, L] 모양의 visibility 결과
+        final_rewards: [M] 모양의 최종 reward 배열
+        save_path: 저장 경로
+        voxel_size: ESDF 시각화용 voxel 크기
+        max_distance: 최대 거리 (미터)
+    """
+    M, L = viewpoint_matrix.shape[:2]
+    
+    # 서브플롯 생성 (M개의 viewpoint set을 각각 표시)
+    fig = make_subplots(
+        rows=1, cols=M,
+        specs=[[{'type': 'scatter3d'} for _ in range(M)]],
+        subplot_titles=[f'Viewpoint Set {i+1} (Reward: {final_rewards[i]:.1f})' for i in range(M)],
+        horizontal_spacing=0.05
+    )
+    
+    # 각 viewpoint set에 대해 ESDF 기반 시각화
+    for set_idx in range(M):
+        # 첫 번째 mapper를 대표로 사용 (실제로는 각 set마다 다른 mapper를 사용해야 함)
+        mapper = mappers[0]  # 간단히 첫 번째 mapper 사용
+        
+        try:
+            # TSDF layer를 사용해서 AABB 범위를 얻음
+            tsdf_layer = mapper.tsdf_layer_view()
+            
+            # 간단한 그리드 생성 (성능을 위해 해상도 제한)
+            min_block_idx, max_block_idx = tsdf_layer.get_block_limits()
+            aabb_min_vox = min_block_idx * tsdf_layer.block_dim_in_voxels
+            aabb_max_vox = (max_block_idx + 1) * tsdf_layer.block_dim_in_voxels
+            
+            # 해상도 제한 (너무 많은 포인트 방지)
+            max_resolution = 20
+            x_step = max(1, (aabb_max_vox[0] - aabb_min_vox[0]) // max_resolution)
+            y_step = max(1, (aabb_max_vox[1] - aabb_min_vox[1]) // max_resolution)
+            z_step = max(1, (aabb_max_vox[2] - aabb_min_vox[2]) // max_resolution)
+            
+            x_linspace = torch.arange(aabb_min_vox[0], aabb_max_vox[0] + 1, x_step, dtype=torch.int)
+            y_linspace = torch.arange(aabb_min_vox[1], aabb_max_vox[1] + 1, y_step, dtype=torch.int)
+            z_linspace = torch.arange(aabb_min_vox[2], aabb_max_vox[2] + 1, z_step, dtype=torch.int)
+            
+            x_grid, y_grid, z_grid = torch.meshgrid(x_linspace, y_linspace, z_linspace, indexing='ij')
+            query_grid_xyz_vox = torch.stack([x_grid, y_grid, z_grid], dim=-1)
+            query_grid_xyz_m = (query_grid_xyz_vox + 0.5) * tsdf_layer.voxel_size()
+            query_grid_xyz_m = query_grid_xyz_m.cuda()
+            
+            # ESDF 쿼리 수행
+            sdf_values = mapper.query_differentiable_layer(
+                QueryType.ESDF, 
+                query_grid_xyz_m.reshape(-1, 3)
+            )
+            sdf_values = sdf_values.reshape(query_grid_xyz_m.shape[:-1])
+            
+            # 유효한 쿼리 마스크 생성
+            from nvblox_torch.constants import constants
+            valid_mask = torch.logical_not(sdf_values == constants.esdf_unknown_distance())
+            distance_mask = torch.abs(sdf_values) <= max_distance
+            valid_mask = valid_mask & distance_mask
+            
+            # 유효한 포인트들만 추출
+            valid_points = query_grid_xyz_m[valid_mask].cpu().numpy()
+            valid_distances = sdf_values[valid_mask].cpu().numpy()
+            
+            # ESDF 거리 필드 시각화
+            if len(valid_points) > 0:
+                # 거리 값에 따른 색상 매핑
+                normalized_distances = (valid_distances + max_distance) / (2 * max_distance)
+                normalized_distances = np.clip(normalized_distances, 0, 1)
+                
+                colors = []
+                for dist in normalized_distances:
+                    if dist < 0.5:  # 음수 거리 (물체 내부)
+                        r, g, b = 1.0, dist * 2, 0.0
+                    else:  # 양수 거리 (물체 외부)
+                        r, g, b = 2.0 - dist * 2, 2.0 - dist * 2, (dist - 0.5) * 2
+                    colors.append(f'rgb({int(r*255)},{int(g*255)},{int(b*255)})')
+                
+                # ESDF voxel grid 시각화
+                fig.add_trace(go.Scatter3d(
+                    x=valid_points[:, 0],
+                    y=valid_points[:, 1],
+                    z=valid_points[:, 2],
+                    mode='markers',
+                    marker=dict(
+                        size=2,
+                        color=colors,
+                        opacity=0.4,
+                        line=dict(width=0)
+                    ),
+                    name=f'ESDF {set_idx+1}',
+                    showlegend=False
+                ), row=1, col=set_idx+1)
+            
+        except Exception as e:
+            print(f"Failed to create ESDF visualization for set {set_idx+1}: {e}")
+            # Fallback: 빈 시각화
+            pass
+        
+        # 쿼리 포인트 표시
+        fig.add_trace(go.Scatter3d(
+            x=[query_point[0]], y=[query_point[1]], z=[query_point[2]],
+            mode='markers',
+            marker=dict(size=6, color='red', symbol='diamond'),
+            name=f'Query {set_idx+1}',
+            showlegend=False
+        ), row=1, col=set_idx+1)
+        
+        # 현재 set의 viewpoints 표시
+        for viewpoint_idx in range(L):
+            viewpoint = viewpoint_matrix[set_idx, viewpoint_idx]
+            visible = visibility_results[set_idx, viewpoint_idx]
+            
+            viewpoint_color = 'green' if visible else 'red'
+            fig.add_trace(go.Scatter3d(
+                x=[viewpoint[0]], y=[viewpoint[1]], z=[viewpoint[2]],
+                mode='markers',
+                marker=dict(size=4, color=viewpoint_color, symbol='circle'),
+                name=f'VP{viewpoint_idx+1}',
+                showlegend=False
+            ), row=1, col=set_idx+1)
+            
+            # Line of Sight 표시
+            los_color = 'green' if visible else 'red'
+            los_style = 'solid' if visible else 'dash'
+            
+            fig.add_trace(go.Scatter3d(
+                x=[viewpoint[0], query_point[0]],
+                y=[viewpoint[1], query_point[1]],
+                z=[viewpoint[2], query_point[2]],
+                mode='lines',
+                line=dict(color=los_color, width=2, dash=los_style),
+                name=f'LoS{viewpoint_idx+1}',
+                showlegend=False
+            ), row=1, col=set_idx+1)
+    
+    # 레이아웃 설정
+    fig.update_layout(
+        title=dict(
+            text=f'ESDF-based Multi-Viewpoint Set Analysis (M={M}, L={L})',
+            x=0.5,
+            font=dict(size=18)
+        ),
+        width=400 * M,
+        height=600,
+        margin=dict(l=0, r=0, t=80, b=0)
+    )
+    
+    # 각 서브플롯의 scene 설정
+    for i in range(1, M+1):
+        fig.update_scenes(
+            xaxis_title='X (m)',
+            yaxis_title='Y (m)', 
+            zaxis_title='Z (m)',
+            aspectmode='data',
+            row=1, col=i
+        )
+    
+    # HTML 파일로 저장
+    import plotly.offline as pyo
+    pyo.plot(fig, filename=save_path, auto_open=False)
+    print(f"ESDF-based multi-viewpoint set 3D visualization saved to: {save_path}")
+
+
 def create_multi_viewpoint_set_3d_visualization(meshes, query_point, viewpoint_matrix, visibility_results, final_rewards, save_path):
     """
     M개의 viewpoint set을 모두 보여주는 3D 시각화
@@ -1079,10 +1858,10 @@ def create_multi_viewpoint_set_3d_visualization(meshes, query_point, viewpoint_m
 
 
 # ========= 로봇 변환을 고려한 nvblox 메시 생성 =========
-def create_mesh_with_robot_transformation_nvblox(rgb, depth, robot_mask, robot_se3_transform, 
+def create_mapper_with_robot_transformation_nvblox(rgb, depth, robot_mask, robot_se3_transform, 
                                                camera_intrinsics, voxel_size=0.005, max_integration_distance=5.0, mapper=None):
     """
-    로봇의 SE(3) 변환을 고려한 nvblox 메시 생성
+    로봇의 SE(3) 변환을 고려한 nvblox mapper 생성 (mesh 없이)
     
     Args:
         rgb: RGB 이미지 (H, W, 3)
@@ -1092,54 +1871,102 @@ def create_mesh_with_robot_transformation_nvblox(rgb, depth, robot_mask, robot_s
         camera_intrinsics: 카메라 내부 파라미터 (3, 3)
         voxel_size: voxel 크기 (미터)
         max_integration_distance: 최대 통합 거리 (미터)
-        return_mapper: True면 (mesh, mapper, robot_points_original, robot_points_transformed) 튜플 반환
+        mapper: 기존 mapper (None이면 새로 생성)
     
     Returns:
-        mesh: 변환된 로봇을 고려한 nvblox ColorMesh
-        robot_points_original: 원본 로봇 포인트들
+        mapper: nvblox Mapper
         robot_points_transformed: 변환된 로봇 포인트들
-        mapper: nvblox Mapper (return_mapper=True일 때만)
     """
-    print("Creating nvblox mesh with robot transformation...")
+    print("Creating nvblox mapper with robot transformation...")
     
     # 1) 현재 RGBD에서 로봇 부분 제거
     rgb_without_robot, depth_without_robot = remove_robot_from_rgbd_direct(rgb, depth, robot_mask)
     
-    # 2) 로봇 포인트들을 SE(3) 변환
-    robot_points_original = transform_robot_points_direct(rgb, depth, robot_mask, np.eye(4), camera_intrinsics)
-    robot_points_transformed = transform_robot_points_direct(rgb, depth, robot_mask, robot_se3_transform, camera_intrinsics)
+    # 2) 로봇 포인트들을 SE(3) 변환 (robot_points_original은 이미 외부에서 생성됨)
+    robot_points_transformed = transform_robot_points_direct(depth, robot_mask, robot_se3_transform, camera_intrinsics)
     
     # 3) 변환된 로봇을 새로운 RGBD에 추가
     rgb_future, depth_future = add_transformed_robot_to_rgbd_direct(
         rgb_without_robot, depth_without_robot, robot_points_transformed, camera_intrinsics
     )
     
-    # 4) nvblox 메시 생성
-    print(f"  Creating mesh from RGBD with {np.sum(depth_future > 0)} valid depth pixels")
-    mesh, mapper = create_mesh_with_nvblox(depth_future, rgb_future, camera_intrinsics, voxel_size, max_integration_distance, return_mapper=True, mapper=mapper)
+    # 4) Transform된 RGBD 이미지 저장 (디버깅용)
+    import os
+    debug_dir = "robot_transform_debug"
+    os.makedirs(debug_dir, exist_ok=True)
     
-    # 디버깅: 생성된 mesh 정보
-    if mesh is not None:
-        print(f"  Generated mesh: {mesh.vertices().shape[0]} vertices, {mesh.triangles().shape[0]} triangles")
-        
-        # Mesh vertices 범위 확인
-        vertices = mesh.vertices().cpu().numpy()
-        mesh_min = np.min(vertices, axis=0)
-        mesh_max = np.max(vertices, axis=0)
-        print(f"  Mesh bounds: min={mesh_min}, max={mesh_max}")
-        
-        # Robot points가 mesh 범위 내에 있는지 확인
-        if len(robot_points_transformed) > 0:
-            robot_min = np.min(robot_points_transformed, axis=0)
-            robot_max = np.max(robot_points_transformed, axis=0)
-            robot_in_mesh = np.all(robot_min >= mesh_min - 0.1) and np.all(robot_max <= mesh_max + 0.1)
-            print(f"  Robot points within mesh bounds: {robot_in_mesh}")
-            if not robot_in_mesh:
-                print(f"  WARNING: Robot points may not be properly integrated into mesh!")
+    # Transform 정보를 파일명에 포함
+    transform_translation = robot_se3_transform[:3, 3]
+    transform_str = f"t{transform_translation[0]:.2f}_{transform_translation[1]:.2f}_{transform_translation[2]:.2f}"
+    
+    # 4x2 그리드로 모든 단계 저장
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+    
+    # 원본 RGB
+    axes[0,0].imshow(rgb)
+    axes[0,0].set_title('Original RGB')
+    axes[0,0].axis('off')
+    
+    # 원본 Depth
+    im1 = axes[0,1].imshow(depth, cmap='magma')
+    axes[0,1].set_title('Original Depth')
+    axes[0,1].axis('off')
+    plt.colorbar(im1, ax=axes[0,1], shrink=0.7)
+    
+    # Robot 제거된 RGB
+    axes[0,2].imshow(rgb_without_robot)
+    axes[0,2].set_title('RGB without Robot')
+    axes[0,2].axis('off')
+    
+    # Robot 제거된 Depth
+    im2 = axes[0,3].imshow(depth_without_robot, cmap='magma')
+    axes[0,3].set_title('Depth without Robot')
+    axes[0,3].axis('off')
+    plt.colorbar(im2, ax=axes[0,3], shrink=0.7)
+    
+    # Transform된 RGB
+    axes[1,0].imshow(rgb_future)
+    axes[1,0].set_title(f'Transformed RGB (t={transform_translation})')
+    axes[1,0].axis('off')
+    
+    # Transform된 Depth
+    im3 = axes[1,1].imshow(depth_future, cmap='magma')
+    axes[1,1].set_title(f'Transformed Depth (t={transform_translation})')
+    axes[1,1].axis('off')
+    plt.colorbar(im3, ax=axes[1,1], shrink=0.7)
+    
+    # Robot points 비교 (빈 공간 활용)
+    axes[1,2].text(0.5, 0.5, f'Robot Transform\nTranslation: {transform_translation}\n\nTransformed Robot Center:\n{np.mean(robot_points_transformed, axis=0)}', 
+                   ha='center', va='center', fontsize=10, 
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
+    axes[1,2].set_title('Transform Info')
+    axes[1,2].axis('off')
+    
+    # Robot points 개수 정보
+    axes[1,3].text(0.5, 0.5, f'Robot Points Count:\nTransformed: {len(robot_points_transformed)}\n\nDepth Pixels:\nOriginal: {np.sum(depth > 0)}\nWithout Robot: {np.sum(depth_without_robot > 0)}\nWith Transform: {np.sum(depth_future > 0)}', 
+                   ha='center', va='center', fontsize=10,
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor="lightblue"))
+    axes[1,3].set_title('Statistics')
+    axes[1,3].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(debug_dir, f"robot_transform_{transform_str}.png"), dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"  Saved robot transform visualization: robot_transform_{transform_str}.png")
+    
+    # 5) nvblox mapper 생성 (mesh 없이)
+    print(f"  Creating mapper from RGBD with {np.sum(depth_future > 0)} valid depth pixels")
+    mapper = create_mapper_with_nvblox(depth_future, rgb_future, camera_intrinsics, voxel_size, max_integration_distance, mapper=mapper)
+    
+    # 디버깅: 생성된 mapper 정보
+    if mapper is not None:
+        print(f"  Generated mapper successfully")
     else:
-        print("  ERROR: Failed to generate mesh!")
+        print("  ERROR: Failed to generate mapper!")
     
-    return mesh, robot_points_original, robot_points_transformed, mapper
+    return mapper, robot_points_transformed
     
 
 def remove_robot_from_rgbd_direct(rgb, depth, robot_mask):
@@ -1157,7 +1984,7 @@ def remove_robot_from_rgbd_direct(rgb, depth, robot_mask):
     return rgb_clean, depth_clean
 
 
-def transform_robot_points_direct(rgb, depth, robot_mask, robot_se3_transform, camera_intrinsics):
+def transform_robot_points_direct(depth, robot_mask, robot_se3_transform, camera_intrinsics):
     """
     로봇 포인트들을 SE(3) 변환 (numpy array 기반)
     """
@@ -1220,7 +2047,7 @@ def add_transformed_robot_to_rgbd_direct(rgb_without_robot, depth_without_robot,
         return rgb_without_robot, depth_without_robot
     
     # Deep copy로 원본 보존
-    rgb_future = copy.deepcopy(rgb_without_robot)
+    rgb_future = copy.deepcopy(rgb_without_robot) # value: [0, 255]
     depth_future = copy.deepcopy(depth_without_robot)
     
     # 변환된 로봇 포인트들을 이미지 좌표로 project
@@ -1258,12 +2085,12 @@ def add_transformed_robot_to_rgbd_direct(rgb_without_robot, depth_without_robot,
                             # 기존 depth가 0이거나 robot이 더 가까우면 업데이트
                             if depth_future[ny, nx] == 0 or depth_future[ny, nx] > adjusted_depth:
                                 depth_future[ny, nx] = adjusted_depth
-                                # 로봇 색상 (회색)으로 설정
-                                rgb_future[ny, nx] = [0.5, 0.5, 0.5]
+                                # 로봇 색상 (회색)으로 설정 [0, 255] 범위
+                                rgb_future[ny, nx] = [128, 128, 128]  # 0.5 * 255 = 127.5 ≈ 128
                                 added_pixels += 1
                             else:
-                                # 기존 depth가 더 가까워도 robot 영역임을 표시하기 위해 색상만 변경
-                                rgb_future[ny, nx] = [0.5, 0.5, 0.5]
+                                # 기존 depth가 더 가까워도 robot 영역임을 표시하기 위해 색상만 변경 [0, 255] 범위
+                                rgb_future[ny, nx] = [128, 128, 128]  # 0.5 * 255 = 127.5 ≈ 128
                                 added_pixels += 1
     
     print(f"  Added {added_pixels} robot pixels from {valid_points} valid transformed points")
@@ -1274,7 +2101,7 @@ def add_transformed_robot_to_rgbd_direct(rgb_without_robot, depth_without_robot,
             from scipy import ndimage
             
             # Robot 영역 마스크 생성 (회색 픽셀들)
-            robot_mask = np.all(rgb_future == [0.5, 0.5, 0.5], axis=2)
+            robot_mask = np.all(rgb_future == [128, 128, 128], axis=2)
             
             # Morphological closing (구멍 메우기)
             kernel_size = 3
@@ -1296,7 +2123,7 @@ def add_transformed_robot_to_rgbd_direct(rgb_without_robot, depth_without_robot,
                         # 주변 depth 값의 평균으로 보간
                         interpolated_depth = np.mean(valid_depths)
                         depth_future[y, x] = interpolated_depth
-                        rgb_future[y, x] = [0.5, 0.5, 0.5]
+                        rgb_future[y, x] = [128, 128, 128]
                         added_pixels += 1
                 
                 print(f"  Morphological closing added {np.sum(new_robot_pixels)} pixels")
@@ -1390,8 +2217,8 @@ def create_robot_se3_transforms_demo(candidate_viewpoints):
 
 # ========= 메인 =========
 def main():
-    print("=== Direct Mesh-based Line-of-Sight Visibility Test with Robot Transformation ===")
-    print("Using TriangleMesh.create_from_depth_image for faster mesh generation")
+    print("=== ESDF-based Line-of-Sight Visibility Test with Robot Transformation ===")
+    print("Using nvblox ESDF layer for ray marching visibility check")
     
     # 전체 실행 시간 측정
     total_start_time = time.time()
@@ -1404,6 +2231,12 @@ def main():
     load_end_time = time.time()
     print(f"Loaded RGB: {rgb.shape}, Depth: {depth_raw.shape}")
     print(f"Data loading time: {load_end_time - load_start_time:.4f} seconds")
+    
+    # 전역 변수로 설정 (RGB point cloud 생성용)
+    global rgb_image_original, depth_image_original, camera_intrinsics_original
+    rgb_image_original = rgb
+    depth_image_original = depth_raw
+    camera_intrinsics_original = K  # 원본 카메라 내부 파라미터
 
     # 1.5) 이미지 리사이즈 (옵션) - UniDepth 사용시에는 RGB만 리사이즈
     if RESIZE:
@@ -1492,9 +2325,9 @@ def main():
     print(f"[Query] pixel=({uq},{vq}), depth={dq:.4f} m, world_pos={Xw_q}")
     print(f"Query point selection time: {query_end_time - query_start_time:.4f} seconds")
 
-    # 5) 각 mesh별로 로봇 변환을 고려한 nvblox 메시 생성
-    print("\n=== 4. nvblox Mesh Generation with Robot Transformation ===")
-    mesh_start_time = time.time()
+    # 5) 각 mapper별로 로봇 변환을 고려한 nvblox mapper 생성
+    print("\n=== 4. nvblox Mapper Generation with Robot Transformation ===")
+    mapper_start_time = time.time()
     
     # 데모용 로봇 segmentation mask 생성
     robot_mask = create_robot_segmentation_mask_demo(rgb_resized.shape)
@@ -1506,25 +2339,26 @@ def main():
     for i, transform in enumerate(robot_se3_transforms):
         print(f"  Transform {i+1}: translation={transform[:3, 3]}")
     
-    # L개의 mesh 생성 (각 column index i에 대응하는 robot transform으로)
-    meshes_with_robot = []
+    # L개의 mapper 생성 (각 column index i에 대응하는 robot transform으로)
     mappers_with_robot = []
-    robot_points_original_list = []
     robot_points_transformed_list = []
     
-    # 각 mesh마다 독립적인 mapper 생성 (robot transform이 제대로 반영되도록)
+    # robot_points_original을 한번만 생성 (모든 mapper에서 공통으로 사용)
+    print(f"  Creating robot_points_original once for all mappers...")
+    robot_points_original = transform_robot_points_direct(depth_m, robot_mask, np.eye(4), K_adjusted)
+    print(f"  robot_points_original created: {len(robot_points_original)} points")
+    
+    # 각 mapper마다 독립적인 mapper 생성 (robot transform이 제대로 반영되도록)
     for i, robot_transform in enumerate(robot_se3_transforms):
-        print(f"  Creating mesh {i+1} with robot transform: translation={robot_transform[:3, 3]}")
+        print(f"  Creating mapper {i+1} with robot transform: translation={robot_transform[:3, 3]}")
         start = time.time()
-        mesh_with_robot, robot_points_original, robot_points_transformed, mapper_robot = create_mesh_with_robot_transformation_nvblox(
+        mapper_robot, robot_points_transformed = create_mapper_with_robot_transformation_nvblox(
             rgb_resized, depth_m, robot_mask, robot_transform, K_adjusted, voxel_size=VOXEL_SIZE, max_integration_distance=5.0, mapper=None  # 독립적인 mapper 사용
         )
-        print(f"  nvblox robot transformed mesh creation time: {time.time() - start:.4f} seconds")
-        meshes_with_robot.append(mesh_with_robot)
+        print(f"  nvblox robot transformed mapper creation time: {time.time() - start:.4f} seconds")
         mappers_with_robot.append(mapper_robot)
-        robot_points_original_list.append(robot_points_original)
         robot_points_transformed_list.append(robot_points_transformed)
-        print(f"  Mesh {i+1}: {mesh_with_robot.vertices().shape[0]} vertices, {mesh_with_robot.triangles().shape[0]} triangles")
+        print(f"  Mapper {i+1}: Created successfully")
         
         # 디버깅: 변환된 로봇 포인트들의 중심점 확인
         if len(robot_points_transformed) > 0:
@@ -1532,18 +2366,63 @@ def main():
             print(f"  Transformed robot center: {transformed_center}")
         
         
-    mesh_end_time = time.time()
-    print(f"\nAll robot-transformed nvblox meshes created successfully in {mesh_end_time - mesh_start_time:.4f} seconds")
+    # Mapper 객체들 디버깅: 각각 다른 인스턴스인지 확인
+    print(f"\n=== Mapper Objects Debugging ===")
+    print(f"Total mappers created: {len(mappers_with_robot)}")
     
-    # 비교를 위해 원본 nvblox 메시도 생성 (mapper도 함께 반환)
-    print("\nCreating original nvblox mesh for comparison...")
-    original_mesh_start_time = time.time()
-    mesh_original, mapper_original = create_mesh_with_nvblox(depth_m, rgb_resized, K_adjusted, voxel_size=VOXEL_SIZE, max_integration_distance=5.0, return_mapper=True)
-    original_mesh_end_time = time.time()
-    print(f"Original nvblox mesh created in {original_mesh_end_time - original_mesh_start_time:.4f} seconds")
-    print(f"Original mesh has {mesh_original.vertices().shape[0]} vertices and {mesh_original.triangles().shape[0]} triangles")
+    for i, mapper in enumerate(mappers_with_robot):
+        print(f"  Mapper {i+1}:")
+        print(f"    - Object ID: {id(mapper)}")
+        print(f"    - Type: {type(mapper)}")
+        
+        # Mapper가 갖고 있는 depth 정보 확인 (TSDF layer에서)
+        try:
+            # TSDF layer의 voxel 정보 확인
+            tsdf_layer = mapper.tsdf_layer_view()
+            print(f"    - TSDF Layer: {tsdf_layer}")
+            print(f"    - TSDF Layer ID: {id(tsdf_layer)}")
+            
+            # ESDF layer 정보 확인 (esdf_layer_view는 존재하지 않음)
+            print(f"    - ESDF Layer: Not directly accessible via esdf_layer_view()")
+            print(f"    - ESDF Layer ID: N/A")
+            
+        except Exception as e:
+            print(f"    - Layer access error: {e}")
     
-    # 6) M개의 viewpoint set에 대해 각 mesh별로 visibility 체크
+    # Mapper 객체들이 서로 다른 인스턴스인지 확인
+    print(f"\n=== Mapper Instance Comparison ===")
+    for i in range(len(mappers_with_robot)):
+        for j in range(i+1, len(mappers_with_robot)):
+            mapper1 = mappers_with_robot[i]
+            mapper2 = mappers_with_robot[j]
+            is_different = id(mapper1) != id(mapper2)
+            print(f"  Mapper {i+1} vs Mapper {j+1}: {'DIFFERENT' if is_different else 'SAME'} instances (IDs: {id(mapper1)} vs {id(mapper2)})")
+            
+            # TSDF layer도 다른 인스턴스인지 확인
+            try:
+                tsdf1 = mapper1.tsdf_layer_view()
+                tsdf2 = mapper2.tsdf_layer_view()
+                tsdf_different = id(tsdf1) != id(tsdf2)
+                print(f"    TSDF Layers: {'DIFFERENT' if tsdf_different else 'SAME'} instances (IDs: {id(tsdf1)} vs {id(tsdf2)})")
+            except Exception as e:
+                print(f"    TSDF Layer comparison error: {e}")
+            
+            # ESDF layer 비교는 직접 접근 불가능
+            print(f"    ESDF Layers: Cannot compare directly (no esdf_layer_view method)")
+    
+    print(f"=== End Mapper Debugging ===\n")
+        
+    mapper_end_time = time.time()
+    print(f"\nAll robot-transformed nvblox mappers created successfully in {mapper_end_time - mapper_start_time:.4f} seconds")
+    
+    # 비교를 위해 원본 nvblox mapper도 생성
+    print("\nCreating original nvblox mapper for comparison...")
+    original_mapper_start_time = time.time()
+    mapper_original = create_mapper_with_nvblox(depth_m, rgb_resized, K_adjusted, voxel_size=VOXEL_SIZE, max_integration_distance=5.0)
+    original_mapper_end_time = time.time()
+    print(f"Original nvblox mapper created in {original_mapper_end_time - original_mapper_start_time:.4f} seconds")
+    
+    # 6) M개의 viewpoint set에 대해 각 mapper별로 ESDF 기반 visibility 체크
     print("\n=== 5. nvblox ESDF Visibility Check ===")
     visibility_start_time = time.time()
     
@@ -1554,53 +2433,48 @@ def main():
     visibility_results = np.zeros((M, L), dtype=bool)  # True if visible, False if occluded
     hit_distances = np.zeros((M, L), dtype=np.float64)  # Hit distances for each viewpoint
     
-    # 각 mesh별로 RaycastingScene을 미리 생성 (성능 최적화)
-    print(f"\n=== Pre-creating RaycastingScenes for {L} meshes ===")
-    scene_creation_start_time = time.time()
-    raycasting_scenes = []
+    # ESDF 기반 visibility 체크를 위한 설정
+    num_samples = 100  # Ray marching 샘플 수
+    print(f"Using ESDF ray marching with {num_samples} samples per ray")
     
-    for mesh_idx in range(L):
-        print(f"  Creating scene for mesh {mesh_idx + 1}...")
-        scene = create_raycasting_scene(meshes_with_robot[mesh_idx])
-        raycasting_scenes.append(scene)
-    
-    scene_creation_end_time = time.time()
-    print(f"All RaycastingScenes created in {scene_creation_end_time - scene_creation_start_time:.4f} seconds")
-    
-    denoising_steps = 5 # dscho temporary debug for SVDD
+    denoising_steps = 2 # dscho temporary debug for SVDD
     for diff_step in range(denoising_steps):
         print('\n------------Denoising step ', diff_step, '------------\n')
-        # 각 mesh별로 (L개의 mesh) visibility 체크
-        for mesh_idx in range(L):  # mesh_idx는 column index i에 해당
-            print(f"\n=== Checking mesh {mesh_idx + 1} (column {mesh_idx}) ===")
-            current_mesh = meshes_with_robot[mesh_idx]
-            current_scene = raycasting_scenes[mesh_idx]
+        # 각 mapper별로 (L개의 mapper) visibility 체크
+        for mapper_idx in range(L):  # mapper_idx는 column index i에 해당
+            print(f"\n=== Checking mapper {mapper_idx + 1} (column {mapper_idx}) ===")
+            current_mapper = mappers_with_robot[mapper_idx]
             
-            # 현재 mesh_idx에 해당하는 column의 viewpoints들을 모음: CANDIDATE_VIEWPOINTS_MATRIX[:, mesh_idx]
-            viewpoints_for_this_mesh = CANDIDATE_VIEWPOINTS_MATRIX[:, mesh_idx]  # [M, 3] 모양
-            print(f"  Viewpoints for this mesh: {viewpoints_for_this_mesh.shape} (M viewpoints)")
+            # 현재 mapper_idx에 해당하는 column의 viewpoints들을 모음: CANDIDATE_VIEWPOINTS_MATRIX[:, mapper_idx]
+            viewpoints_for_this_mapper = CANDIDATE_VIEWPOINTS_MATRIX[:, mapper_idx]  # [M, 3] 모양
+            print(f"  Viewpoints for this mapper: {viewpoints_for_this_mapper.shape} (M viewpoints)")
             
+            # ESDF 기반 batch visibility 체크
+            print(f"  Performing ESDF ray marching for {M} viewpoints...")
             
-            # Batch raycasting 방식 (미리 생성된 scene 사용)
-            print(f"  Performing batch raycasting for {M} viewpoints...")
+            # 각 viewpoint에서 query point까지의 거리 계산
+            origins = viewpoints_for_this_mapper  # [M, 3] 모양
+            distances = np.linalg.norm(Xw_q - origins, axis=1)  # [M] 모양 - 각 ray의 거리
+            max_distances = distances - OFFSET_DISTANCE  # [M] 모양
             
-            # Batch raycasting을 위한 ray 생성
-            origins = viewpoints_for_this_mesh  # [M, 3] 모양
-            directions = Xw_q - origins  # [M, 3] 모양 - 각 viewpoint에서 query point로의 방향
-            distances = np.linalg.norm(directions, axis=1)  # [M] 모양 - 각 ray의 거리
-            directions = directions / distances[:, np.newaxis]  # 정규화된 방향 벡터 [M, 3]
-            
-            # 미리 생성된 scene을 사용한 batch raycasting 수행
-            batch_visible, batch_hit_distances = batch_raycasting_with_scene(
-                current_scene, origins, directions, distances-OFFSET_DISTANCE
+            # ESDF 기반 batch visibility 체크 수행
+            batch_visible, batch_hit_distances = batch_esdf_visibility_check(
+                current_mapper, origins, Xw_q, max_distances, num_samples
             )
             
             # 결과 저장
             for set_idx in range(M):
-                visibility_results[set_idx, mesh_idx] = batch_visible[set_idx]
-                hit_distances[set_idx, mesh_idx] = batch_hit_distances[set_idx]
+                visibility_results[set_idx, mapper_idx] = batch_visible[set_idx]
+                hit_distances[set_idx, mapper_idx] = batch_hit_distances[set_idx]
                 
-                print(f"    Set {set_idx + 1}: {viewpoints_for_this_mesh[set_idx]} -> {'VISIBLE' if batch_visible[set_idx] else 'OCCLUDED'} (hit: {batch_hit_distances[set_idx]:.3f}m)")
+                # Query point까지의 실제 거리 계산
+                query_distance = distances[set_idx]
+                
+                # Query point에서 카메라 원점까지의 거리 계산
+                camera_origin = np.array([0.0, 0.0, 0.0])
+                query_to_camera_distance = np.linalg.norm(Xw_q - camera_origin)
+                
+                print(f"    Set {set_idx + 1}: {viewpoints_for_this_mapper[set_idx]} -> {'VISIBLE' if batch_visible[set_idx] else 'OCCLUDED'} (hit: {batch_hit_distances[set_idx]:.3f}m, query_dist: {query_distance:.3f}m, query_to_camera: {query_to_camera_distance:.3f}m)")
             
     
     visibility_end_time = time.time()
@@ -1673,7 +2547,8 @@ def main():
     viz_start_time = time.time()
     
     import os
-    os.makedirs("visibility_test_output", exist_ok=True)
+    save_path = "visibility_test_output_esdf"
+    os.makedirs(save_path, exist_ok=True)
     
     # 2D 시각화 (segmentation mask 포함)
     fig, ax = plt.subplots(2, 2, figsize=(15, 10))
@@ -1711,9 +2586,9 @@ def main():
     ax[1,1].legend()
     
     plt.tight_layout()
-    plt.savefig("visibility_test_output/rgb_depth_query_with_robot_mask.png", dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(save_path, "rgb_depth_query_with_robot_mask.png"), dpi=150, bbox_inches='tight')
     plt.close()
-    print("2D visualization with robot mask saved to: visibility_test_output/rgb_depth_query_with_robot_mask.png")
+    print("2D visualization with robot mask saved to: ", os.path.join(save_path, "rgb_depth_query_with_robot_mask.png"))
     
     # Reward 매트릭스 시각화
     fig, ax = plt.subplots(1, 2, figsize=(15, 6))
@@ -1746,28 +2621,28 @@ def main():
         ax[1].text(i+1, reward + 0.1, f'{reward:.1f}', ha='center', va='bottom', fontweight='bold')
     
     plt.tight_layout()
-    plt.savefig("visibility_test_output/reward_analysis.png", dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(save_path, "reward_analysis.png"), dpi=150, bbox_inches='tight')
     plt.close()
-    print("Reward analysis visualization saved to: visibility_test_output/reward_analysis.png")
+    print("Reward analysis visualization saved to: ", os.path.join(save_path, "reward_analysis.png"))
 
-    # 3D 시각화 - 각 mesh별로 독립적인 시각화 생성
-    print("Creating individual 3D visualizations for each mesh...")
+    # 3D 시각화 - 각 mapper별로 독립적인 시각화 생성 (ESDF 기반)
+    print("Creating individual 3D visualizations for each mapper...")
     
-    # 각 mesh별로 시각화 생성
-    for mesh_idx in range(L):
-        print(f"Creating visualization for mesh {mesh_idx + 1}...")
+    # 각 mapper별로 시각화 생성
+    for mapper_idx in range(L):
+        print(f"Creating visualization for mapper {mapper_idx + 1}...")
         
-        # 현재 mesh와 관련 데이터
-        current_mesh = meshes_with_robot[mesh_idx]
-        current_robot_points_original = robot_points_original_list[mesh_idx]
-        current_robot_points_transformed = robot_points_transformed_list[mesh_idx]
+        # 현재 mapper와 관련 데이터
+        current_mapper = mappers_with_robot[mapper_idx]  # ESDF 쿼리를 위한 mapper
+        current_robot_points_original = robot_points_original  # 공통으로 사용
+        current_robot_points_transformed = robot_points_transformed_list[mapper_idx]
         
-        # 현재 mesh에 대한 visibility 결과만 추출 (모든 viewpoint set에서)
-        current_mesh_results = []
+        # 현재 mapper에 대한 visibility 결과만 추출 (모든 viewpoint set에서)
+        current_mapper_results = []
         for set_idx in range(M):
-            visible = visibility_results[set_idx, mesh_idx]
-            hit_distance = hit_distances[set_idx, mesh_idx]
-            viewpoint = CANDIDATE_VIEWPOINTS_MATRIX[set_idx, mesh_idx]
+            visible = visibility_results[set_idx, mapper_idx]
+            hit_distance = hit_distances[set_idx, mapper_idx]
+            viewpoint = CANDIDATE_VIEWPOINTS_MATRIX[set_idx, mapper_idx]
             
             # 각 viewpoint에서 query point까지의 거리 계산
             distance_to_query = np.linalg.norm(Xw_q - viewpoint)
@@ -1776,45 +2651,48 @@ def main():
                 'viewpoint': viewpoint,
                 'yaw_deg': 0.0,  # 기본값
                 'visible_robot': visible,
-                'visible_original': visible,  # 호환성을 위해 동일하게 설정
+                'visible_original': visible,  # ESDF 기반이므로 동일
                 'hit_distance_robot': hit_distance,
-                'hit_distance_original': hit_distance,  # 호환성을 위해 동일하게 설정
+                'hit_distance_original': hit_distance,  # ESDF 기반이므로 동일
                 'distance_to_query': distance_to_query
             }
-            current_mesh_results.append(result)
+            current_mapper_results.append(result)
         
-        # 현재 mesh에 대한 시각화 생성
-        create_3d_visualization_plotly(
-            current_mesh, Xw_q, CANDIDATE_VIEWPOINTS_MATRIX[:, mesh_idx], current_mesh_results,
-            f"visibility_test_output/3d_visualization_mesh_{mesh_idx + 1}.html",
-            robot_mask, current_robot_points_original, current_robot_points_transformed
+        # 현재 mapper에 대한 Ray 기반 ESDF 시각화 생성
+        create_ray_based_esdf_3d_visualization_plotly_new(
+            current_mapper, Xw_q, CANDIDATE_VIEWPOINTS_MATRIX[:, mapper_idx], current_mapper_results,
+            os.path.join(save_path, f"3d_ray_esdf_visualization_mapper_{mapper_idx + 1}.html"),
+            robot_mask, current_robot_points_original, current_robot_points_transformed,
+            voxel_size=VOXEL_SIZE, max_distance=1.0, num_ray_samples=50
         )
     
-    # 원본 mesh와 비교를 위한 시각화 생성
-    print("Creating original mesh visualization for comparison...")
+    # 원본 mapper와 비교를 위한 시각화 생성
+    print("Creating original mapper visualization for comparison...")
     original_results = []
     for i, viewpoint in enumerate(CANDIDATE_VIEWPOINTS):
-        # 원본 mesh에서는 모든 viewpoint가 visible하다고 가정 (실제로는 원본 mesh로 테스트해야 함)
+        # 원본 mapper에서는 모든 viewpoint가 visible하다고 가정
         original_results.append({
             'viewpoint': viewpoint,
             'yaw_deg': 0.0,
             'visible_robot': True,  # 원본에서는 가정
-            'visible_original': True,
+            'visible_original': True,  # ESDF 기반이므로 동일
             'hit_distance_robot': 0.0,
-            'hit_distance_original': 0.0,
+            'hit_distance_original': 0.0,  # ESDF 기반이므로 동일
             'distance_to_query': np.linalg.norm(Xw_q - viewpoint)
         })
     
-    create_3d_visualization_plotly(
-        mesh_original, Xw_q, CANDIDATE_VIEWPOINTS, original_results,
-        "visibility_test_output/3d_visualization_original.html",
-        robot_mask, robot_points_original_list[0] if len(robot_points_original_list) > 0 else None, None
+    create_ray_based_esdf_3d_visualization_plotly_new(
+        mapper_original, Xw_q, CANDIDATE_VIEWPOINTS, original_results,
+        os.path.join(save_path, "3d_ray_esdf_visualization_original.html"),
+        robot_mask, robot_points_original, None,
+        voxel_size=VOXEL_SIZE, max_distance=1.0, num_ray_samples=50
     )
     
-    # M개의 viewpoint set을 모두 보여주는 3D 시각화 생성
-    create_multi_viewpoint_set_3d_visualization(meshes_with_robot, Xw_q, CANDIDATE_VIEWPOINTS_MATRIX, 
-                                               visibility_results, final_rewards,
-                                               "visibility_test_output/3d_multi_viewpoint_sets.html")
+    # M개의 viewpoint set을 모두 보여주는 3D 시각화 생성 (ESDF 기반)
+    create_esdf_multi_viewpoint_set_3d_visualization(mappers_with_robot, Xw_q, CANDIDATE_VIEWPOINTS_MATRIX, 
+                                                    visibility_results, final_rewards,
+                                                    os.path.join(save_path, "3d_multi_viewpoint_sets_esdf.html"),
+                                                    voxel_size=VOXEL_SIZE, max_distance=1.0)
     
     
     

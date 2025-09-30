@@ -38,7 +38,7 @@ OFFSET_DISTANCE = 0.05 # for convex part of the constructed mesh
 
 # TSDF 설정
 # Mesh 품질 선택: "high_resolution" (5mm), "medium_resolution" (10mm), "low_resolution" (20mm)
-MESH_QUALITY = "medium_resolution" # "medium_resolution"  # "high_resolution", "medium_resolution", "low_resolution"
+MESH_QUALITY = "low_resolution" # "medium_resolution"  # "high_resolution", "medium_resolution", "low_resolution"
 
 if MESH_QUALITY == "high_resolution":
     VOXEL_SIZE = 0.005  # 5mm - 높은 해상도, 조각난 mesh
@@ -372,138 +372,133 @@ def create_mesh_with_nvblox(depth_image, rgb_image, K, voxel_size=0.005, max_int
 
 
 
-# ========= nvblox ESDF 기반 Visibility 체크 =========
-def nvblox_mesh_to_open3d(nvblox_mesh):
+# ========= nvblox TSDF 기반 Visibility 체크 =========
+def check_visibility_with_tsdf_ray_marching(mapper, origin, target_point, max_distance, num_samples=100, mapper_id=0):
     """
-    nvblox ColorMesh를 Open3D TriangleMesh로 변환
+    TSDF layer를 사용한 ray marching으로 visibility 체크
     
     Args:
-        nvblox_mesh: nvblox ColorMesh 객체
+        mapper: nvblox Mapper 객체
+        origin: 레이 시작점 (월드 좌표)
+        target_point: 목표 점 (월드 좌표)
+        max_distance: 최대 거리
+        num_samples: ray marching 샘플 수
+        mapper_id: mapper ID
     
     Returns:
-        o3d.geometry.TriangleMesh: Open3D 메시 객체
+        (visible, hit_distance, hit_point)
+        - visible: True if point is visible
+        - hit_distance: distance to first hit (if any)
+        - hit_point: hit point coordinates (if any)
     """
-    
-    # # nvblox mesh에서 vertices와 triangles 추출
-    # vertices = nvblox_mesh.vertices().cpu().numpy()
-    # triangles = nvblox_mesh.triangles().cpu().numpy()
-    
-    # if len(vertices) == 0 or len(triangles) == 0:
-    #     return None
-    
-    # # Open3D 메시 생성
-    # mesh = o3d.geometry.TriangleMesh()
-    # mesh.vertices = o3d.utility.Vector3dVector(vertices)
-    # mesh.triangles = o3d.utility.Vector3iVector(triangles)
-    
-    # # 법선 계산 (raycasting에 필요)
-    # mesh.compute_vertex_normals()
-
-
-    # dscho debug
-    mesh = nvblox_mesh.to_open3d()
-    
-    return mesh
-    
-
-
-
-
-
-    
-    
-
-
-
-
-
-
-def create_raycasting_scene(mesh):
-    """
-    nvblox mesh로부터 Open3D RaycastingScene을 미리 생성
-    
-    Args:
-        mesh: nvblox ColorMesh 객체
-    
-    Returns:
-        scene: o3d.t.geometry.RaycastingScene 객체
-    """
-    print("    Creating raycasting scene...")
     start_time = time.time()
     
-    # 1. nvblox mesh를 Open3D로 변환
-    open3d_mesh = nvblox_mesh_to_open3d(mesh)
+    # 방향 벡터 계산
+    direction = target_point - origin
+    distance = np.linalg.norm(direction)
+    if distance == 0:
+        return True, 0, None
     
-    if open3d_mesh is None:
-        print("    Failed to convert mesh, returning None")
-        return None
+    direction = direction / distance
     
-    # 2. 메시를 tensor로 변환
-    mesh_tensor = o3d.t.geometry.TriangleMesh.from_legacy(open3d_mesh)
+    # Ray marching을 위한 샘플 포인트들 생성
+    sample_distances = np.linspace(0, min(distance, max_distance), num_samples)
+    sample_points = origin + direction.reshape(1, 3) * sample_distances.reshape(-1, 1)
     
-    # 3. Ray casting scene 생성
-    scene = o3d.t.geometry.RaycastingScene()
-    scene.add_triangles(mesh_tensor)
+    # TSDF layer에서 distance 값들 쿼리
+    sample_points_tensor = torch.from_numpy(sample_points.astype(np.float32)).cuda()
+    
+    # TSDF 쿼리 수행
+    tsdf_results = mapper.query_layer(
+        query_type=QueryType.TSDF,
+        query=sample_points_tensor,
+        mapper_id=mapper_id
+    )
+    
+    # TSDF 결과에서 distance와 weight 추출
+    tsdf_distances = tsdf_results[:, 0].cpu().numpy()  # [num_samples]
+    tsdf_weights = tsdf_results[:, 1].cpu().numpy()    # [num_samples]
+    
+    # Visibility 판단 로직
+    # TSDF distance < 0이면 물체 내부, weight > 0이면 유효한 측정값
+    # Ray가 물체에 부딪히는 첫 번째 지점을 찾음
+    hit_mask = (tsdf_distances < 0) & (tsdf_weights > 0.1)  # weight threshold
+    
+    if np.any(hit_mask):
+        # 첫 번째 hit 지점 찾기
+        first_hit_idx = np.argmax(hit_mask)
+        hit_distance = sample_distances[first_hit_idx]
+        hit_point = sample_points[first_hit_idx]
+        
+        # Hit point가 target point보다 가까우면 occluded
+        if hit_distance < distance - 0.01:  # 작은 tolerance
+            visible = False
+        else:
+            visible = True
+            hit_distance = distance
+            hit_point = target_point
+    else:
+        # Hit이 없으면 visible
+        visible = True
+        hit_distance = distance
+        hit_point = target_point
     
     end_time = time.time()
-    print(f"    Scene creation time: {end_time - start_time:.4f}s")
+    print(f"    TSDF ray marching visibility check: {end_time - start_time:.4f}s")
     
-    return scene
+    return visible, hit_distance, hit_point
 
 
-def batch_raycasting_with_scene(scene, origins, directions, max_distances):
+def batch_tsdf_visibility_check(mapper, origins, target_point, max_distances, num_samples=100, mapper_id=0):
     """
-    미리 생성된 Open3D RaycastingScene을 사용한 batch raycasting
+    TSDF layer를 사용한 batch visibility 체크
     
     Args:
-        scene: 미리 생성된 o3d.t.geometry.RaycastingScene 객체
+        mapper: nvblox Mapper 객체
         origins: 레이 시작점들 [M, 3]
-        directions: 레이 방향들 (정규화된 벡터) [M, 3]
+        target_point: 목표 점 (월드 좌표)
         max_distances: 최대 거리들 [M]
+        num_samples: ray marching 샘플 수
+        mapper_id: mapper ID
     
     Returns:
         (visible_array, hit_distances_array)
         - visible_array: [M] boolean array, True if visible
         - hit_distances_array: [M] float array, hit distances
     """
-    if scene is None:
-        print("    Scene is None, assuming all visible")
-        return np.ones(len(origins), dtype=bool), max_distances.copy()
-    
     total_start_time = time.time()
     
-    # 1. Batch ray 생성
-    step1_start = time.time()
-    rays = np.hstack([origins, directions])
-    rays_tensor = o3d.core.Tensor(rays, dtype=o3d.core.Dtype.Float32)
-    step1_time = time.time() - step1_start
-    print(f"      Step 1 - Ray preparation: {step1_time:.4f}s")
+    M = len(origins)
+    visible_array = np.zeros(M, dtype=bool)
+    hit_distances_array = np.zeros(M, dtype=np.float64)
     
-    # 2. Batch raycasting 수행
-    step2_start = time.time()
-    ans = scene.cast_rays(rays_tensor)
-    step2_time = (time.time() - step2_start)
-    print(f"      Step 2 - Ray casting: {step2_time:.4f}s")
-    
-    # 3. 결과 분석
-    step3_start = time.time()
-    hit_distances = ans['t_hit'].numpy()  # [M]
-    
-    # Visibility 판단: hit이 inf이거나 max_distance보다 크면 visible
-    visible = np.logical_or(np.isinf(hit_distances), hit_distances > max_distances)
-    
-    # Hit distance 조정: visible한 경우 max_distance로 설정
-    hit_distances_adjusted = np.where(visible, max_distances, hit_distances)
-    step3_time = time.time() - step3_start
-    print(f"      Step 3 - Result processing: {step3_time:.4f}s")
+    # 각 ray에 대해 개별적으로 처리 (batch 처리 최적화는 나중에)
+    for i in range(M):
+        visible, hit_distance, _ = check_visibility_with_tsdf_ray_marching(
+            mapper, origins[i], target_point, max_distances[i], num_samples, mapper_id
+        )
+        visible_array[i] = visible
+        hit_distances_array[i] = hit_distance
     
     total_time = time.time() - total_start_time
-    print(f"    Batch raycasting ({len(origins)} rays): {total_time:.4f}s total")
+    print(f"    Batch TSDF visibility check ({M} rays): {total_time:.4f}s total")
     
-    # 각 단계별 시간 요약
-    print(f"      Time breakdown: rays={step1_time:.4f}s, casting={step2_time:.4f}s, processing={step3_time:.4f}s")
+    return visible_array, hit_distances_array
     
-    return visible, hit_distances_adjusted
+
+
+
+
+
+    
+    
+
+
+
+
+
+
+# 기존 mesh 기반 raycasting 함수들은 TSDF 기반 함수로 교체됨
 
 
 
@@ -1390,8 +1385,8 @@ def create_robot_se3_transforms_demo(candidate_viewpoints):
 
 # ========= 메인 =========
 def main():
-    print("=== Direct Mesh-based Line-of-Sight Visibility Test with Robot Transformation ===")
-    print("Using TriangleMesh.create_from_depth_image for faster mesh generation")
+    print("=== TSDF-based Line-of-Sight Visibility Test with Robot Transformation ===")
+    print("Using nvblox TSDF layer for ray marching visibility check")
     
     # 전체 실행 시간 측정
     total_start_time = time.time()
@@ -1543,8 +1538,8 @@ def main():
     print(f"Original nvblox mesh created in {original_mesh_end_time - original_mesh_start_time:.4f} seconds")
     print(f"Original mesh has {mesh_original.vertices().shape[0]} vertices and {mesh_original.triangles().shape[0]} triangles")
     
-    # 6) M개의 viewpoint set에 대해 각 mesh별로 visibility 체크
-    print("\n=== 5. nvblox ESDF Visibility Check ===")
+    # 6) M개의 viewpoint set에 대해 각 mapper별로 TSDF 기반 visibility 체크
+    print("\n=== 5. nvblox TSDF Visibility Check ===")
     visibility_start_time = time.time()
     
     print(f"Processing {M} viewpoint sets, each with {L} viewpoints...")
@@ -1554,57 +1549,45 @@ def main():
     visibility_results = np.zeros((M, L), dtype=bool)  # True if visible, False if occluded
     hit_distances = np.zeros((M, L), dtype=np.float64)  # Hit distances for each viewpoint
     
-    # 각 mesh별로 RaycastingScene을 미리 생성 (성능 최적화)
-    print(f"\n=== Pre-creating RaycastingScenes for {L} meshes ===")
-    scene_creation_start_time = time.time()
-    raycasting_scenes = []
-    
-    for mesh_idx in range(L):
-        print(f"  Creating scene for mesh {mesh_idx + 1}...")
-        scene = create_raycasting_scene(meshes_with_robot[mesh_idx])
-        raycasting_scenes.append(scene)
-    
-    scene_creation_end_time = time.time()
-    print(f"All RaycastingScenes created in {scene_creation_end_time - scene_creation_start_time:.4f} seconds")
+    # TSDF 기반 visibility 체크를 위한 설정
+    num_samples = 100  # Ray marching 샘플 수
+    print(f"Using TSDF ray marching with {num_samples} samples per ray")
     
     denoising_steps = 5 # dscho temporary debug for SVDD
     for diff_step in range(denoising_steps):
         print('\n------------Denoising step ', diff_step, '------------\n')
-        # 각 mesh별로 (L개의 mesh) visibility 체크
-        for mesh_idx in range(L):  # mesh_idx는 column index i에 해당
-            print(f"\n=== Checking mesh {mesh_idx + 1} (column {mesh_idx}) ===")
-            current_mesh = meshes_with_robot[mesh_idx]
-            current_scene = raycasting_scenes[mesh_idx]
+        # 각 mapper별로 (L개의 mapper) visibility 체크
+        for mapper_idx in range(L):  # mapper_idx는 column index i에 해당
+            print(f"\n=== Checking mapper {mapper_idx + 1} (column {mapper_idx}) ===")
+            current_mapper = mappers_with_robot[mapper_idx]
             
-            # 현재 mesh_idx에 해당하는 column의 viewpoints들을 모음: CANDIDATE_VIEWPOINTS_MATRIX[:, mesh_idx]
-            viewpoints_for_this_mesh = CANDIDATE_VIEWPOINTS_MATRIX[:, mesh_idx]  # [M, 3] 모양
-            print(f"  Viewpoints for this mesh: {viewpoints_for_this_mesh.shape} (M viewpoints)")
+            # 현재 mapper_idx에 해당하는 column의 viewpoints들을 모음: CANDIDATE_VIEWPOINTS_MATRIX[:, mapper_idx]
+            viewpoints_for_this_mapper = CANDIDATE_VIEWPOINTS_MATRIX[:, mapper_idx]  # [M, 3] 모양
+            print(f"  Viewpoints for this mapper: {viewpoints_for_this_mapper.shape} (M viewpoints)")
             
+            # TSDF 기반 batch visibility 체크
+            print(f"  Performing TSDF ray marching for {M} viewpoints...")
             
-            # Batch raycasting 방식 (미리 생성된 scene 사용)
-            print(f"  Performing batch raycasting for {M} viewpoints...")
+            # 각 viewpoint에서 query point까지의 거리 계산
+            origins = viewpoints_for_this_mapper  # [M, 3] 모양
+            distances = np.linalg.norm(Xw_q - origins, axis=1)  # [M] 모양 - 각 ray의 거리
+            max_distances = distances - OFFSET_DISTANCE  # [M] 모양
             
-            # Batch raycasting을 위한 ray 생성
-            origins = viewpoints_for_this_mesh  # [M, 3] 모양
-            directions = Xw_q - origins  # [M, 3] 모양 - 각 viewpoint에서 query point로의 방향
-            distances = np.linalg.norm(directions, axis=1)  # [M] 모양 - 각 ray의 거리
-            directions = directions / distances[:, np.newaxis]  # 정규화된 방향 벡터 [M, 3]
-            
-            # 미리 생성된 scene을 사용한 batch raycasting 수행
-            batch_visible, batch_hit_distances = batch_raycasting_with_scene(
-                current_scene, origins, directions, distances-OFFSET_DISTANCE
+            # TSDF 기반 batch visibility 체크 수행
+            batch_visible, batch_hit_distances = batch_tsdf_visibility_check(
+                current_mapper, origins, Xw_q, max_distances, num_samples, mapper_id=0
             )
             
             # 결과 저장
             for set_idx in range(M):
-                visibility_results[set_idx, mesh_idx] = batch_visible[set_idx]
-                hit_distances[set_idx, mesh_idx] = batch_hit_distances[set_idx]
+                visibility_results[set_idx, mapper_idx] = batch_visible[set_idx]
+                hit_distances[set_idx, mapper_idx] = batch_hit_distances[set_idx]
                 
-                print(f"    Set {set_idx + 1}: {viewpoints_for_this_mesh[set_idx]} -> {'VISIBLE' if batch_visible[set_idx] else 'OCCLUDED'} (hit: {batch_hit_distances[set_idx]:.3f}m)")
+                print(f"    Set {set_idx + 1}: {viewpoints_for_this_mapper[set_idx]} -> {'VISIBLE' if batch_visible[set_idx] else 'OCCLUDED'} (hit: {batch_hit_distances[set_idx]:.3f}m)")
             
     
     visibility_end_time = time.time()
-    print(f"\nnvblox ESDF visibility check time: {visibility_end_time - visibility_start_time:.4f} seconds")
+    print(f"\nnvblox TSDF visibility check time: {visibility_end_time - visibility_start_time:.4f} seconds")
     
     # 7) Reward 계산 (visible=1, occluded=0)
     print("\n=== 6. Reward Calculation ===")
@@ -1673,7 +1656,8 @@ def main():
     viz_start_time = time.time()
     
     import os
-    os.makedirs("visibility_test_output", exist_ok=True)
+    save_path = "visibility_test_output_tsdf"
+    os.makedirs(save_path, exist_ok=True)
     
     # 2D 시각화 (segmentation mask 포함)
     fig, ax = plt.subplots(2, 2, figsize=(15, 10))
@@ -1711,9 +1695,9 @@ def main():
     ax[1,1].legend()
     
     plt.tight_layout()
-    plt.savefig("visibility_test_output/rgb_depth_query_with_robot_mask.png", dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(save_path, "rgb_depth_query_with_robot_mask.png"), dpi=150, bbox_inches='tight')
     plt.close()
-    print("2D visualization with robot mask saved to: visibility_test_output/rgb_depth_query_with_robot_mask.png")
+    print("2D visualization with robot mask saved to: ", os.path.join(save_path, "rgb_depth_query_with_robot_mask.png"))
     
     # Reward 매트릭스 시각화
     fig, ax = plt.subplots(1, 2, figsize=(15, 6))
@@ -1746,28 +1730,28 @@ def main():
         ax[1].text(i+1, reward + 0.1, f'{reward:.1f}', ha='center', va='bottom', fontweight='bold')
     
     plt.tight_layout()
-    plt.savefig("visibility_test_output/reward_analysis.png", dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(save_path, "reward_analysis.png"), dpi=150, bbox_inches='tight')
     plt.close()
-    print("Reward analysis visualization saved to: visibility_test_output/reward_analysis.png")
+    print("Reward analysis visualization saved to: ", os.path.join(save_path, "reward_analysis.png"))
 
-    # 3D 시각화 - 각 mesh별로 독립적인 시각화 생성
-    print("Creating individual 3D visualizations for each mesh...")
+    # 3D 시각화 - 각 mapper별로 독립적인 시각화 생성 (TSDF 기반)
+    print("Creating individual 3D visualizations for each mapper...")
     
-    # 각 mesh별로 시각화 생성
-    for mesh_idx in range(L):
-        print(f"Creating visualization for mesh {mesh_idx + 1}...")
+    # 각 mapper별로 시각화 생성
+    for mapper_idx in range(L):
+        print(f"Creating visualization for mapper {mapper_idx + 1}...")
         
-        # 현재 mesh와 관련 데이터
-        current_mesh = meshes_with_robot[mesh_idx]
-        current_robot_points_original = robot_points_original_list[mesh_idx]
-        current_robot_points_transformed = robot_points_transformed_list[mesh_idx]
+        # 현재 mapper와 관련 데이터
+        current_mesh = meshes_with_robot[mapper_idx]  # 시각화를 위해 mesh는 여전히 사용
+        current_robot_points_original = robot_points_original_list[mapper_idx]
+        current_robot_points_transformed = robot_points_transformed_list[mapper_idx]
         
-        # 현재 mesh에 대한 visibility 결과만 추출 (모든 viewpoint set에서)
-        current_mesh_results = []
+        # 현재 mapper에 대한 visibility 결과만 추출 (모든 viewpoint set에서)
+        current_mapper_results = []
         for set_idx in range(M):
-            visible = visibility_results[set_idx, mesh_idx]
-            hit_distance = hit_distances[set_idx, mesh_idx]
-            viewpoint = CANDIDATE_VIEWPOINTS_MATRIX[set_idx, mesh_idx]
+            visible = visibility_results[set_idx, mapper_idx]
+            hit_distance = hit_distances[set_idx, mapper_idx]
+            viewpoint = CANDIDATE_VIEWPOINTS_MATRIX[set_idx, mapper_idx]
             
             # 각 viewpoint에서 query point까지의 거리 계산
             distance_to_query = np.linalg.norm(Xw_q - viewpoint)
@@ -1781,12 +1765,12 @@ def main():
                 'hit_distance_original': hit_distance,  # 호환성을 위해 동일하게 설정
                 'distance_to_query': distance_to_query
             }
-            current_mesh_results.append(result)
+            current_mapper_results.append(result)
         
-        # 현재 mesh에 대한 시각화 생성
+        # 현재 mapper에 대한 시각화 생성 (mesh는 시각화용으로만 사용)
         create_3d_visualization_plotly(
-            current_mesh, Xw_q, CANDIDATE_VIEWPOINTS_MATRIX[:, mesh_idx], current_mesh_results,
-            f"visibility_test_output/3d_visualization_mesh_{mesh_idx + 1}.html",
+            current_mesh, Xw_q, CANDIDATE_VIEWPOINTS_MATRIX[:, mapper_idx], current_mapper_results,
+            os.path.join(save_path, f"3d_visualization_mapper_{mapper_idx + 1}.html"),
             robot_mask, current_robot_points_original, current_robot_points_transformed
         )
     
@@ -1807,14 +1791,14 @@ def main():
     
     create_3d_visualization_plotly(
         mesh_original, Xw_q, CANDIDATE_VIEWPOINTS, original_results,
-        "visibility_test_output/3d_visualization_original.html",
+        os.path.join(save_path, "3d_visualization_original.html"),
         robot_mask, robot_points_original_list[0] if len(robot_points_original_list) > 0 else None, None
     )
     
-    # M개의 viewpoint set을 모두 보여주는 3D 시각화 생성
+    # M개의 viewpoint set을 모두 보여주는 3D 시각화 생성 (TSDF 기반)
     create_multi_viewpoint_set_3d_visualization(meshes_with_robot, Xw_q, CANDIDATE_VIEWPOINTS_MATRIX, 
                                                visibility_results, final_rewards,
-                                               "visibility_test_output/3d_multi_viewpoint_sets.html")
+                                               os.path.join(save_path, "3d_multi_viewpoint_sets_tsdf.html"))
     
     
     

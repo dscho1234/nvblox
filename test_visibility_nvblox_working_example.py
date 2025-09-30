@@ -34,23 +34,10 @@ BUFFER_PATH = "/home/dscho-larr/fast_storage/dscho/im2flow2act/data/realworld_hu
 EPISODE_IDX = 0
 FRAME_IDX = 100  # 특정 프레임 선택
 DEPTH_SCALE = 0.001        # 깊이 단위 → 미터 변환 (예: mm면 0.001, 이미 m면 1.0)
-OFFSET_DISTANCE = 0.05 # for convex part of the constructed mesh
 
 # TSDF 설정
-# Mesh 품질 선택: "high_resolution" (5mm), "medium_resolution" (10mm), "low_resolution" (20mm)
-MESH_QUALITY = "medium_resolution" # "medium_resolution"  # "high_resolution", "medium_resolution", "low_resolution"
-
-if MESH_QUALITY == "high_resolution":
-    VOXEL_SIZE = 0.005  # 5mm - 높은 해상도, 조각난 mesh
-    
-elif MESH_QUALITY == "medium_resolution":
-    VOXEL_SIZE = 0.01   # 10mm - 중간 해상도, 균형잡힌 mesh
-    
-else:  # low_resolution
-    VOXEL_SIZE = 0.02   # 20mm - 낮은 해상도, 매끄러운 mesh
-    
-
-print(f"Using {MESH_QUALITY}: voxel_size={VOXEL_SIZE}m")
+VOXEL_SIZE = 0.005 # 0.005  # 5mm voxel size (이미지에서 권장하는 3-5mm 범위)
+TSDF_TRUNCATION = 0.02  # 2cm truncation distance (voxel_size * 4)
 
 # Depth estimation 설정
 USE_MONODEPTH = True  # True: UniDepth 사용, False: raw depth 사용
@@ -68,38 +55,16 @@ K = np.array([
 ], dtype=np.float64)
 
 # 새 카메라 뷰포인트들 (월드 좌표, world = 원 카메라 좌표계로 가정)
-# CANDIDATE_VIEWPOINTS = [
-#     np.array([0.20, 0.00, 0.00], dtype=np.float64),  # 옆으로
-#     np.array([0.00, 0.20, 0.00], dtype=np.float64),  # 위로
-#     np.array([0.00, 0.00, 0.20], dtype=np.float64),  # 앞으로
-#     np.array([0.15, 0.15, 0.00], dtype=np.float64),  # 대각선
-#     np.array([0.15, 0.15, 0.15], dtype=np.float64),  # 3D 대각선
-# ]
 CANDIDATE_VIEWPOINTS = [
-    np.array([-0.05, 0.00, 0.00], dtype=np.float64),
-    np.array([-0.10, 0.00, 0.00], dtype=np.float64),
-    np.array([-0.15, 0.00, 0.00], dtype=np.float64),
-    np.array([-0.20, 0.00, 0.00], dtype=np.float64),
-    np.array([-0.25, 0.00, 0.00], dtype=np.float64),
+    np.array([0.20, 0.00, 0.00], dtype=np.float64),  # 옆으로
+    np.array([0.00, 0.20, 0.00], dtype=np.float64),  # 위로
+    np.array([0.00, 0.00, 0.20], dtype=np.float64),  # 앞으로
+    np.array([0.15, 0.15, 0.00], dtype=np.float64),  # 대각선
+    np.array([0.15, 0.15, 0.15], dtype=np.float64),  # 3D 대각선
 ]
-
 
 # 각 viewpoint의 yaw 회전 (deg)
 CANDIDATE_YAW_DEGS = [0.0, 0.0, 0.0, 0.0, 0.0]
-
-# M개의 viewpoint set 생성 (예제에서는 M=3으로 설정)
-M = 10 # 3  # M개의 viewpoint set
-L = len(CANDIDATE_VIEWPOINTS)  # L개의 viewpoints per set
-
-
-
-print(f"Creating {M} viewpoint sets, each with {L} viewpoints")
-print(f"Total viewpoints: {M} x {L} = {M*L}")
-
-# [M, L] 모양의 candidate viewpoints 배열 생성
-# 현재는 예제로 기존 CANDIDATE_VIEWPOINTS를 M번 복사
-CANDIDATE_VIEWPOINTS_MATRIX = np.array([CANDIDATE_VIEWPOINTS for _ in range(M)])
-print(f"Candidate viewpoints matrix shape: {CANDIDATE_VIEWPOINTS_MATRIX.shape}")  # [M, L, 3]
 
 
 # ========= 유틸 함수 =========
@@ -259,6 +224,17 @@ def scale_depth_with_raw(depth_pred, depth_raw, intrinsics):
         return depth_pred
 
 
+def depth_to_vertices(K, depth_m):
+    """K: (3,3), depth_m: (H,W) in meters -> (H,W,3) in camera-0 coords (OpenCV 픽셀 기준)"""
+    H, W = depth_m.shape
+    ys, xs = np.meshgrid(np.arange(H), np.arange(W), indexing='ij')
+    fx, fy = K[0,0], K[1,1]
+    cx, cy = K[0,2], K[1,2]
+    z = depth_m
+    x = (xs - cx) * z / fx
+    y = (ys - cy) * z / fy
+    V = np.stack([x, y, z], axis=-1)
+    return V  # (H,W,3)
 
 
 def pick_query_pixel(depth_m):
@@ -384,126 +360,120 @@ def nvblox_mesh_to_open3d(nvblox_mesh):
         o3d.geometry.TriangleMesh: Open3D 메시 객체
     """
     
-    # # nvblox mesh에서 vertices와 triangles 추출
-    # vertices = nvblox_mesh.vertices().cpu().numpy()
-    # triangles = nvblox_mesh.triangles().cpu().numpy()
+    # nvblox mesh에서 vertices와 triangles 추출
+    vertices = nvblox_mesh.vertices().cpu().numpy()
+    triangles = nvblox_mesh.triangles().cpu().numpy()
     
-    # if len(vertices) == 0 or len(triangles) == 0:
-    #     return None
+    if len(vertices) == 0 or len(triangles) == 0:
+        return None
     
-    # # Open3D 메시 생성
-    # mesh = o3d.geometry.TriangleMesh()
-    # mesh.vertices = o3d.utility.Vector3dVector(vertices)
-    # mesh.triangles = o3d.utility.Vector3iVector(triangles)
+    # Open3D 메시 생성
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(vertices)
+    mesh.triangles = o3d.utility.Vector3iVector(triangles)
     
-    # # 법선 계산 (raycasting에 필요)
-    # mesh.compute_vertex_normals()
-
-
-    # dscho debug
-    mesh = nvblox_mesh.to_open3d()
+    # 법선 계산 (raycasting에 필요)
+    mesh.compute_vertex_normals()
     
     return mesh
     
 
 
 
-
-
-    
-    
-
-
-
-
-
-
-def create_raycasting_scene(mesh):
+def check_visibility_with_nvblox_mesh_raycast(mesh, origin, target_point, max_distance, num_samples=50):
     """
-    nvblox mesh로부터 Open3D RaycastingScene을 미리 생성
+    nvblox mesh를 Open3D로 변환하여 tensor 기반 ray casting으로 visibility 체크
     
     Args:
         mesh: nvblox ColorMesh 객체
+        origin: 레이 시작점 (월드 좌표)
+        target_point: 목표 점 (월드 좌표)
+        max_distance: 최대 거리
+        num_samples: 사용되지 않음 (Open3D raycasting은 샘플링 불필요)
     
     Returns:
-        scene: o3d.t.geometry.RaycastingScene 객체
+        (visible, hit_distance, hit_point)
+        - visible: True if point is visible
+        - hit_distance: distance to first hit (if any)
+        - hit_point: hit point coordinates (if any)
     """
-    print("    Creating raycasting scene...")
     start_time = time.time()
     
-    # 1. nvblox mesh를 Open3D로 변환
+    # 방향 벡터 계산
+    direction = target_point - origin
+    distance = np.linalg.norm(direction)
+    if distance == 0:
+        return True, 0, None
+    
+    direction = direction / distance
+    
+    
+    # nvblox mesh를 Open3D로 변환
     open3d_mesh = nvblox_mesh_to_open3d(mesh)
     
     if open3d_mesh is None:
-        print("    Failed to convert mesh, returning None")
-        return None
+        print("    Failed to convert mesh, assuming visible")
+        return True, max_distance, None
     
-    # 2. 메시를 tensor로 변환
-    mesh_tensor = o3d.t.geometry.TriangleMesh.from_legacy(open3d_mesh)
+    print(f"    Mesh has {len(open3d_mesh.vertices)} vertices, {len(open3d_mesh.triangles)} triangles")
     
-    # 3. Ray casting scene 생성
+    # Open3D tensor 기반 ray casting 사용
+    visible, hit_distance, hit_point = ray_casting_with_open3d_mesh(
+        open3d_mesh, origin, direction, max_distance
+    )
+    
+    end_time = time.time()
+    print(f"    nvblox mesh raycast visibility check: {end_time - start_time:.4f}seconds")
+    
+    return visible, hit_distance, hit_point
+    
+    
+
+
+def ray_casting_with_open3d_mesh(mesh, origin, direction, max_distance):
+    """
+    Open3D 메시를 사용한 ray casting으로 line-of-sight 체크 (비교용)
+    
+    Args:
+        mesh: Open3D TriangleMesh 객체
+        origin: 레이 시작점 (월드 좌표)
+        direction: 레이 방향 (정규화된 벡터)
+        max_distance: 최대 거리
+    
+    Returns:
+        (visible, hit_distance, hit_point)
+        - visible: True if point is visible
+        - hit_distance: distance to first hit (if any)
+        - hit_point: hit point coordinates (if any)
+    """
+    start_time = time.time()
+    
+    # 레이 생성
+    ray = o3d.core.Tensor([origin.tolist() + direction.tolist()], dtype=o3d.core.Dtype.Float32)
+    
+    # 메시를 tensor로 변환
+    mesh_tensor = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
+    
+    # Ray casting 수행
     scene = o3d.t.geometry.RaycastingScene()
     scene.add_triangles(mesh_tensor)
     
+    # 레이와 메시의 교차점 계산
+    ans = scene.cast_rays(ray)
+    
+    # 결과 분석
+    hit = ans['t_hit'].numpy()[0]
+    
     end_time = time.time()
-    print(f"    Scene creation time: {end_time - start_time:.4f}s")
+    print(f"    Ray casting: {end_time - start_time:.4f}seconds")
     
-    return scene
-
-
-def batch_raycasting_with_scene(scene, origins, directions, max_distances):
-    """
-    미리 생성된 Open3D RaycastingScene을 사용한 batch raycasting
-    
-    Args:
-        scene: 미리 생성된 o3d.t.geometry.RaycastingScene 객체
-        origins: 레이 시작점들 [M, 3]
-        directions: 레이 방향들 (정규화된 벡터) [M, 3]
-        max_distances: 최대 거리들 [M]
-    
-    Returns:
-        (visible_array, hit_distances_array)
-        - visible_array: [M] boolean array, True if visible
-        - hit_distances_array: [M] float array, hit distances
-    """
-    if scene is None:
-        print("    Scene is None, assuming all visible")
-        return np.ones(len(origins), dtype=bool), max_distances.copy()
-    
-    total_start_time = time.time()
-    
-    # 1. Batch ray 생성
-    step1_start = time.time()
-    rays = np.hstack([origins, directions])
-    rays_tensor = o3d.core.Tensor(rays, dtype=o3d.core.Dtype.Float32)
-    step1_time = time.time() - step1_start
-    print(f"      Step 1 - Ray preparation: {step1_time:.4f}s")
-    
-    # 2. Batch raycasting 수행
-    step2_start = time.time()
-    ans = scene.cast_rays(rays_tensor)
-    step2_time = (time.time() - step2_start)
-    print(f"      Step 2 - Ray casting: {step2_time:.4f}s")
-    
-    # 3. 결과 분석
-    step3_start = time.time()
-    hit_distances = ans['t_hit'].numpy()  # [M]
-    
-    # Visibility 판단: hit이 inf이거나 max_distance보다 크면 visible
-    visible = np.logical_or(np.isinf(hit_distances), hit_distances > max_distances)
-    
-    # Hit distance 조정: visible한 경우 max_distance로 설정
-    hit_distances_adjusted = np.where(visible, max_distances, hit_distances)
-    step3_time = time.time() - step3_start
-    print(f"      Step 3 - Result processing: {step3_time:.4f}s")
-    
-    total_time = time.time() - total_start_time
-    print(f"    Batch raycasting ({len(origins)} rays): {total_time:.4f}s total")
-    
-    # 각 단계별 시간 요약
-    print(f"      Time breakdown: rays={step1_time:.4f}s, casting={step2_time:.4f}s, processing={step3_time:.4f}s")
-    
-    return visible, hit_distances_adjusted
+    if np.isinf(hit) or hit > max_distance:
+        # 교차점이 없거나 너무 멀리 있음
+        return True, max_distance, None
+    else:
+        # 교차점이 있음
+        hit_point = origin + hit * direction
+        return False, hit, hit_point
 
 
 
@@ -526,108 +496,45 @@ def create_3d_visualization_plotly(mesh, query_point, candidate_viewpoints, resu
         faces = np.asarray(mesh.triangles)
         vertex_colors = np.asarray(mesh.vertex_colors) if hasattr(mesh, 'vertex_colors') and len(mesh.vertex_colors) > 0 else None
     
-    # 디버깅: mesh 정보 출력
-    print(f"=== Mesh Visualization Debug ===")
-    print(f"Mesh vertices: {len(vertices)}")
-    print(f"Mesh faces: {len(faces)}")
-    print(f"Robot points original: {len(robot_points_original) if robot_points_original is not None else 0}")
-    print(f"Robot points transformed: {len(robot_points_transformed) if robot_points_transformed is not None else 0}")
-    
-    # Robot transform으로 인한 mesh 변화 확인
-    if robot_points_original is not None and robot_points_transformed is not None:
-        print(f"Robot transformation applied: {len(robot_points_original)} -> {len(robot_points_transformed)} points")
-        # 변환된 robot points가 mesh에 포함되어 있는지 확인
-        if len(robot_points_transformed) > 0:
-            # 변환된 robot points의 범위 확인
-            robot_min = np.min(robot_points_transformed, axis=0)
-            robot_max = np.max(robot_points_transformed, axis=0)
-            print(f"Transformed robot bounds: min={robot_min}, max={robot_max}")
-            
-            # Mesh vertices 범위 확인
-            mesh_min = np.min(vertices, axis=0)
-            mesh_max = np.max(vertices, axis=0)
-            print(f"Mesh bounds: min={mesh_min}, max={mesh_max}")
-            
-            # Robot points가 mesh 범위 내에 있는지 확인
-            robot_in_mesh = np.all(robot_min >= mesh_min - 0.1) and np.all(robot_max <= mesh_max + 0.1)
-            print(f"Robot points within mesh bounds: {robot_in_mesh}")
-    
-    # 디버깅 정보 출력
-    print(f"Mesh data: {len(vertices)} vertices, {len(faces)} faces")
-    if len(faces) > 0:
-        max_face_idx = np.max(faces)
-        min_face_idx = np.min(faces)
-        print(f"Face indices range: {min_face_idx} to {max_face_idx}")
-        print(f"Vertex indices range: 0 to {len(vertices)-1}")
-        
-        # Face 인덱스가 vertex 범위를 벗어나는지 확인
-        if max_face_idx >= len(vertices):
-            print(f"WARNING: Face indices exceed vertex range! Max face idx: {max_face_idx}, Max vertex idx: {len(vertices)-1}")
-            # 잘못된 face들을 필터링
-            valid_faces = faces[np.all(faces < len(vertices), axis=1)]
-            print(f"Filtered faces: {len(valid_faces)} valid faces out of {len(faces)}")
-            faces = valid_faces
+    # 메시를 샘플링해서 너무 많은 점을 줄임 (성능 향상)
+    if len(vertices) > 10000:
+        # 랜덤 샘플링
+        indices = np.random.choice(len(vertices), 10000, replace=False)
+        vertices = vertices[indices]
     
     # 3D 시각화 생성
     fig = go.Figure()
     
-    # 1. 메시 표시 (실제 mesh로 시각화)
-    if len(faces) > 0 and len(vertices) > 0:
-        # 간단한 샘플링: 면의 수만 제한하고 vertex는 그대로 유지
-        if len(faces) > 50000:
-            # 면의 수를 제한 (vertex는 그대로 유지) - 더 많은 face 사용
-            face_indices = np.random.choice(len(faces), 50000, replace=False)
-            faces_sampled = faces[face_indices]
-            print(f"Sampled {len(faces_sampled)} faces from {len(faces)} total faces")
-        else:
-            faces_sampled = faces
+    # 1. 메시 표시 (색상 정보 포함)
+    if vertex_colors is not None and len(vertex_colors) > 0:
+        # 색상 정보가 있는 경우
+        colors = vertex_colors
+        if len(colors) > 10000:
+            colors = colors[indices]
         
-        # Mesh3d로 실제 mesh 표시 (vertex 인덱스는 원본 그대로 사용)
-        if vertex_colors is not None and len(vertex_colors) > 0:
-            # RGB 색상 정보가 있는 경우 - 실제 RGB 색상 사용
-            if vertex_colors.max() <= 1.0:
-                # Open3D 형식 (0-1 범위)
-                colors_rgb = vertex_colors
-            else:
-                # nvblox 형식 (0-255 범위) - 0-1로 정규화
-                colors_rgb = vertex_colors / 255.0
-            
-            # RGB 색상을 hex 문자열로 변환
-            colors_hex = []
-            for color in colors_rgb:
-                r, g, b = int(color[0] * 255), int(color[1] * 255), int(color[2] * 255)
-                colors_hex.append(f'rgb({r},{g},{b})')
-            
-            # RGB 색상을 사용한 mesh 시각화
-            fig.add_trace(go.Mesh3d(
-                x=vertices[:, 0],
-                y=vertices[:, 1],
-                z=vertices[:, 2],
-                i=faces_sampled[:, 0],
-                j=faces_sampled[:, 1],
-                k=faces_sampled[:, 2],
-                facecolor=colors_hex,  # 실제 RGB 색상 사용
-                opacity=0.8,
-                name='3D Mesh (RGB Colored)',
-                showlegend=True
-            ))
+        # RGB 색상을 hex로 변환 (nvblox는 0-255 범위, Open3D는 0-1 범위)
+        if colors.max() <= 1.0:
+            # Open3D 형식 (0-1 범위)
+            color_hex = [f'rgb({int(c[0]*255)},{int(c[1]*255)},{int(c[2]*255)})' for c in colors]
         else:
-            # 색상 정보가 없는 경우 (기본 색상)
-            fig.add_trace(go.Mesh3d(
-                x=vertices[:, 0],
-                y=vertices[:, 1],
-                z=vertices[:, 2],
-                i=faces_sampled[:, 0],
-                j=faces_sampled[:, 1],
-                k=faces_sampled[:, 2],
-                color='lightblue',
-                opacity=0.6,
-                name='3D Mesh',
-                showlegend=True
-            ))
+            # nvblox 형식 (0-255 범위)
+            color_hex = [f'rgb({int(c[0])},{int(c[1])},{int(c[2])})' for c in colors]
+        
+        fig.add_trace(go.Scatter3d(
+            x=vertices[:, 0],
+            y=vertices[:, 1], 
+            z=vertices[:, 2],
+            mode='markers',
+            marker=dict(
+                size=3,
+                color=color_hex,
+                opacity=0.8
+            ),
+            name='3D Scene (Colored)',
+            showlegend=True
+        ))
     else:
-        # Fallback: point cloud로 표시
-        print("Warning: No faces found, falling back to point cloud visualization")
+        # 색상 정보가 없는 경우 (기본 색상)
         fig.add_trace(go.Scatter3d(
             x=vertices[:, 0],
             y=vertices[:, 1], 
@@ -638,147 +545,57 @@ def create_3d_visualization_plotly(mesh, query_point, candidate_viewpoints, resu
                 color='lightblue',
                 opacity=0.6
             ),
-            name='3D Scene (Point Cloud)',
+            name='3D Scene',
             showlegend=True
         ))
     
-    # 1.5. 원본 로봇 포인트들을 mesh로 표시 (빨간색)
+    # 1.5. 원본 로봇 포인트들 표시 (빨간색)
     if robot_points_original is not None and len(robot_points_original) > 0:
         # 로봇 포인트들을 샘플링 (너무 많으면)
-        if len(robot_points_original) > 2000:
-            robot_indices = np.random.choice(len(robot_points_original), 2000, replace=False)
+        if len(robot_points_original) > 1000:
+            robot_indices = np.random.choice(len(robot_points_original), 1000, replace=False)
             robot_original_sampled = robot_points_original[robot_indices]
         else:
             robot_original_sampled = robot_points_original
-        
-        # Robot points를 mesh로 변환하여 표시
-        try:
-            # Open3D PointCloud 생성
-            robot_pcd = o3d.geometry.PointCloud()
-            robot_pcd.points = o3d.utility.Vector3dVector(robot_original_sampled)
             
-            # Convex hull을 사용하여 mesh 생성
-            robot_hull, _ = robot_pcd.compute_convex_hull()
-            robot_vertices = np.asarray(robot_hull.vertices)
-            robot_faces = np.asarray(robot_hull.triangles)
-            
-            if len(robot_faces) > 0:
-                # Robot mesh를 시각화 (빨간색, 반투명)
-                fig.add_trace(go.Mesh3d(
-                    x=robot_vertices[:, 0],
-                    y=robot_vertices[:, 1],
-                    z=robot_vertices[:, 2],
-                    i=robot_faces[:, 0],
-                    j=robot_faces[:, 1],
-                    k=robot_faces[:, 2],
-                    color='red',
-                    opacity=0.3,
-                    name='Original Robot Mesh',
-                    showlegend=True
-                ))
-                print(f"Original robot mesh created: {len(robot_vertices)} vertices, {len(robot_faces)} faces")
-            else:
-                # Fallback: point cloud로 표시
-                fig.add_trace(go.Scatter3d(
-                    x=robot_original_sampled[:, 0],
-                    y=robot_original_sampled[:, 1],
-                    z=robot_original_sampled[:, 2],
-                    mode='markers',
-                    marker=dict(
-                        size=4,
-                        color='red',
-                        opacity=0.7,
-                        symbol='circle'
-                    ),
-                    name='Original Robot Points',
-                    showlegend=True
-                ))
-        except Exception as e:
-            print(f"Failed to create original robot mesh: {e}")
-            # Fallback: point cloud로 표시
-            fig.add_trace(go.Scatter3d(
-                x=robot_original_sampled[:, 0],
-                y=robot_original_sampled[:, 1],
-                z=robot_original_sampled[:, 2],
-                mode='markers',
-                marker=dict(
-                    size=4,
-                    color='red',
-                    opacity=0.7,
-                    symbol='circle'
-                ),
-                name='Original Robot Points',
-                showlegend=True
-            ))
+        fig.add_trace(go.Scatter3d(
+            x=robot_original_sampled[:, 0],
+            y=robot_original_sampled[:, 1],
+            z=robot_original_sampled[:, 2],
+            mode='markers',
+            marker=dict(
+                size=4,
+                color='red',
+                opacity=0.7,
+                symbol='circle'
+            ),
+            name='Original Robot Points',
+            showlegend=True
+        ))
     
-    # 1.6. 변환된 로봇 포인트들을 mesh로 표시 (주황색)
+    # 1.6. 변환된 로봇 포인트들 표시 (주황색)
     if robot_points_transformed is not None and len(robot_points_transformed) > 0:
         # 로봇 포인트들을 샘플링 (너무 많으면)
-        if len(robot_points_transformed) > 2000:
-            robot_indices = np.random.choice(len(robot_points_transformed), 2000, replace=False)
+        if len(robot_points_transformed) > 1000:
+            robot_indices = np.random.choice(len(robot_points_transformed), 1000, replace=False)
             robot_transformed_sampled = robot_points_transformed[robot_indices]
         else:
             robot_transformed_sampled = robot_points_transformed
-        
-        # Robot points를 mesh로 변환하여 표시
-        try:
-            # Open3D PointCloud 생성
-            robot_pcd = o3d.geometry.PointCloud()
-            robot_pcd.points = o3d.utility.Vector3dVector(robot_transformed_sampled)
             
-            # Convex hull을 사용하여 mesh 생성
-            robot_hull, _ = robot_pcd.compute_convex_hull()
-            robot_vertices = np.asarray(robot_hull.vertices)
-            robot_faces = np.asarray(robot_hull.triangles)
-            
-            if len(robot_faces) > 0:
-                # Robot mesh를 시각화 (주황색, 반투명)
-                fig.add_trace(go.Mesh3d(
-                    x=robot_vertices[:, 0],
-                    y=robot_vertices[:, 1],
-                    z=robot_vertices[:, 2],
-                    i=robot_faces[:, 0],
-                    j=robot_faces[:, 1],
-                    k=robot_faces[:, 2],
-                    color='orange',
-                    opacity=0.4,
-                    name='Transformed Robot Mesh',
-                    showlegend=True
-                ))
-                print(f"Robot mesh created: {len(robot_vertices)} vertices, {len(robot_faces)} faces")
-            else:
-                # Fallback: point cloud로 표시
-                fig.add_trace(go.Scatter3d(
-                    x=robot_transformed_sampled[:, 0],
-                    y=robot_transformed_sampled[:, 1],
-                    z=robot_transformed_sampled[:, 2],
-                    mode='markers',
-                    marker=dict(
-                        size=4,
-                        color='orange',
-                        opacity=0.7,
-                        symbol='square'
-                    ),
-                    name='Transformed Robot Points',
-                    showlegend=True
-                ))
-        except Exception as e:
-            print(f"Failed to create robot mesh: {e}")
-            # Fallback: point cloud로 표시
-            fig.add_trace(go.Scatter3d(
-                x=robot_transformed_sampled[:, 0],
-                y=robot_transformed_sampled[:, 1],
-                z=robot_transformed_sampled[:, 2],
-                mode='markers',
-                marker=dict(
-                    size=4,
-                    color='orange',
-                    opacity=0.7,
-                    symbol='square'
-                ),
-                name='Transformed Robot Points',
-                showlegend=True
-            ))
+        fig.add_trace(go.Scatter3d(
+            x=robot_transformed_sampled[:, 0],
+            y=robot_transformed_sampled[:, 1],
+            z=robot_transformed_sampled[:, 2],
+            mode='markers',
+            marker=dict(
+                size=4,
+                color='orange',
+                opacity=0.7,
+                symbol='square'
+            ),
+            name='Transformed Robot Points',
+            showlegend=True
+        ))
         
         # 변환 벡터 표시 (화살표)
         if robot_points_original is not None and len(robot_points_original) > 0:
@@ -915,7 +732,7 @@ def create_3d_visualization_plotly(mesh, query_point, candidate_viewpoints, resu
     # 레이아웃 설정
     fig.update_layout(
         title=dict(
-            text='3D Line of Sight Analysis: Scene Mesh + Robot Transform Visualization',
+            text='3D Line of Sight Visibility Analysis with Robot Transformation',
             x=0.5,
             font=dict(size=18)
         ),
@@ -946,136 +763,118 @@ def create_3d_visualization_plotly(mesh, query_point, candidate_viewpoints, resu
     print(f"3D visualization saved to: {save_path}")
 
 
-
-def create_multi_viewpoint_set_3d_visualization(meshes, query_point, viewpoint_matrix, visibility_results, final_rewards, save_path):
+def create_comprehensive_3d_visualization(mesh, query_point, candidate_viewpoints, results, save_path):
     """
-    M개의 viewpoint set을 모두 보여주는 3D 시각화
-    
-    Args:
-        meshes: L개의 mesh 리스트
-        query_point: 쿼리 포인트
-        viewpoint_matrix: [M, L, 3] 모양의 viewpoint 매트릭스
-        visibility_results: [M, L] 모양의 visibility 결과
-        final_rewards: [M] 모양의 최종 reward 배열
-        save_path: 저장 경로
+    더 상세한 3D 시각화 (메시 + 점들 + LoS)
     """
-    M, L = viewpoint_matrix.shape[:2]
+    # 메시 데이터 추출 (nvblox ColorMesh 또는 Open3D mesh 모두 지원)
+    if hasattr(mesh, 'vertices') and callable(mesh.vertices):
+        # nvblox ColorMesh
+        vertices = mesh.vertices().cpu().numpy()
+        faces = mesh.triangles().cpu().numpy()
+    else:
+        # Open3D mesh (fallback)
+        vertices = np.asarray(mesh.vertices)
+        faces = np.asarray(mesh.triangles)
     
-    # 서브플롯 생성 (M개의 viewpoint set을 각각 표시)
+    # 메시를 샘플링 (성능을 위해)
+    if len(vertices) > 5000:
+        indices = np.random.choice(len(vertices), 5000, replace=False)
+        vertices = vertices[indices]
+    
+    # 서브플롯 생성 (2x2)
     fig = make_subplots(
-        rows=1, cols=M,
-        specs=[[{'type': 'scatter3d'} for _ in range(M)]],
-        subplot_titles=[f'Viewpoint Set {i+1} (Reward: {final_rewards[i]:.1f})' for i in range(M)],
-        horizontal_spacing=0.05
+        rows=2, cols=2,
+        specs=[[{'type': 'scatter3d'}, {'type': 'scatter3d'}],
+               [{'type': 'scatter3d'}, {'type': 'scatter3d'}]],
+        subplot_titles=('Full 3D Scene', 'Viewpoints Only', 'Line of Sight Analysis', 'Hit Points Detail'),
+        vertical_spacing=0.1,
+        horizontal_spacing=0.1
     )
     
-    # 각 viewpoint set에 대해 시각화
-    for set_idx in range(M):
-        # 첫 번째 mesh를 대표로 사용 (실제로는 각 set마다 다른 mesh를 사용해야 함)
-        mesh = meshes[0]  # 간단히 첫 번째 mesh 사용
-        
-        # 메시 데이터 추출
-        if hasattr(mesh, 'vertices') and callable(mesh.vertices):
-            vertices = mesh.vertices().cpu().numpy()
-            faces = mesh.triangles().cpu().numpy()
-        else:
-            vertices = np.asarray(mesh.vertices)
-            faces = np.asarray(mesh.triangles)
-        
-        # 메시를 샘플링 (성능을 위해) - 면의 수만 제한
-        if len(faces) > 5000:
-            # 면의 수를 제한 (vertex는 그대로 유지)
-            face_indices = np.random.choice(len(faces), 5000, replace=False)
-            faces_sampled = faces[face_indices]
-        else:
-            faces_sampled = faces
-        
-        # 메시 표시 (실제 mesh로)
-        if len(faces_sampled) > 0:
-            fig.add_trace(go.Mesh3d(
-                x=vertices[:, 0],
-                y=vertices[:, 1],
-                z=vertices[:, 2],
-                i=faces_sampled[:, 0],
-                j=faces_sampled[:, 1],
-                k=faces_sampled[:, 2],
-                color='lightblue',
-                opacity=0.3,
-                name=f'Scene {set_idx+1}',
-                showlegend=False
-            ), row=1, col=set_idx+1)
-        else:
-            # Fallback: point cloud
-            fig.add_trace(go.Scatter3d(
-                x=vertices[:, 0], y=vertices[:, 1], z=vertices[:, 2],
-                mode='markers',
-                marker=dict(size=2, color='lightblue', opacity=0.3),
-                name=f'Scene {set_idx+1}',
-                showlegend=False
-            ), row=1, col=set_idx+1)
-        
-        # 쿼리 포인트 표시
+    # 1. 전체 3D 장면 (좌상)
+    fig.add_trace(go.Scatter3d(
+        x=vertices[:, 0], y=vertices[:, 1], z=vertices[:, 2],
+        mode='markers',
+        marker=dict(size=1, color='lightblue', opacity=0.3),
+        name='Scene',
+        showlegend=False
+    ), row=1, col=1)
+    
+    # 2. Viewpoints만 (우상)
+    for i, (viewpoint, result) in enumerate(zip(candidate_viewpoints, results)):
+        viewpoint_color = 'green' if result['visible_robot'] else 'red'
         fig.add_trace(go.Scatter3d(
-            x=[query_point[0]], y=[query_point[1]], z=[query_point[2]],
+            x=[viewpoint[0]], y=[viewpoint[1]], z=[viewpoint[2]],
             mode='markers',
-            marker=dict(size=8, color='red', symbol='diamond'),
-            name=f'Query {set_idx+1}',
+            marker=dict(size=8, color=viewpoint_color, symbol='circle'),
+            name=f'VP{i+1}',
             showlegend=False
-        ), row=1, col=set_idx+1)
-        
-        # 현재 set의 viewpoints 표시
-        for viewpoint_idx in range(L):
-            viewpoint = viewpoint_matrix[set_idx, viewpoint_idx]
-            visible = visibility_results[set_idx, viewpoint_idx]
+        ), row=1, col=2)
+    
+    # 3. Line of Sight 분석 (좌하)
+    fig.add_trace(go.Scatter3d(
+        x=[query_point[0]], y=[query_point[1]], z=[query_point[2]],
+        mode='markers',
+        marker=dict(size=10, color='red', symbol='diamond'),
+        name='Query',
+        showlegend=False
+    ), row=2, col=1)
+    
+    for i, (viewpoint, result) in enumerate(zip(candidate_viewpoints, results)):
+        los_color = 'green' if result['visible_robot'] else 'red'
+        fig.add_trace(go.Scatter3d(
+            x=[viewpoint[0], query_point[0]],
+            y=[viewpoint[1], query_point[1]],
+            z=[viewpoint[2], query_point[2]],
+            mode='lines',
+            line=dict(color=los_color, width=3),
+            name=f'LoS{i+1}',
+            showlegend=False
+        ), row=2, col=1)
+    
+    # 4. Hit Points 상세 (우하)
+    for i, (viewpoint, result) in enumerate(zip(candidate_viewpoints, results)):
+        if not result['visible_robot']:
+            hit_distance = result['hit_distance_robot']
+            direction = query_point - viewpoint
+            direction = direction / np.linalg.norm(direction)
+            hit_point = viewpoint + direction * hit_distance
             
-            viewpoint_color = 'green' if visible else 'red'
             fig.add_trace(go.Scatter3d(
-                x=[viewpoint[0]], y=[viewpoint[1]], z=[viewpoint[2]],
+                x=[hit_point[0]], y=[hit_point[1]], z=[hit_point[2]],
                 mode='markers',
-                marker=dict(size=6, color=viewpoint_color, symbol='circle'),
-                name=f'VP{viewpoint_idx+1}',
+                marker=dict(size=6, color='orange', symbol='x'),
+                name=f'Hit{i+1}',
                 showlegend=False
-            ), row=1, col=set_idx+1)
-            
-            # Line of Sight 표시
-            los_color = 'green' if visible else 'red'
-            los_style = 'solid' if visible else 'dash'
-            
-            fig.add_trace(go.Scatter3d(
-                x=[viewpoint[0], query_point[0]],
-                y=[viewpoint[1], query_point[1]],
-                z=[viewpoint[2], query_point[2]],
-                mode='lines',
-                line=dict(color=los_color, width=2, dash=los_style),
-                name=f'LoS{viewpoint_idx+1}',
-                showlegend=False
-            ), row=1, col=set_idx+1)
+            ), row=2, col=2)
     
     # 레이아웃 설정
     fig.update_layout(
         title=dict(
-            text=f'Multi-Viewpoint Set Analysis (M={M}, L={L})',
+            text='Comprehensive 3D Line of Sight Analysis',
             x=0.5,
             font=dict(size=18)
         ),
-        width=400 * M,
-        height=600,
+        width=1400,
+        height=1000,
         margin=dict(l=0, r=0, t=80, b=0)
     )
     
     # 각 서브플롯의 scene 설정
-    for i in range(1, M+1):
-        fig.update_scenes(
-            xaxis_title='X (m)',
-            yaxis_title='Y (m)', 
-            zaxis_title='Z (m)',
-            aspectmode='data',
-            row=1, col=i
-        )
+    for i in range(1, 3):
+        for j in range(1, 3):
+            fig.update_scenes(
+                xaxis_title='X (m)',
+                yaxis_title='Y (m)', 
+                zaxis_title='Z (m)',
+                aspectmode='data',
+                row=i, col=j
+            )
     
     # HTML 파일로 저장
     pyo.plot(fig, filename=save_path, auto_open=False)
-    print(f"Multi-viewpoint set 3D visualization saved to: {save_path}")
+    print(f"Comprehensive 3D visualization saved to: {save_path}")
 
 
 # ========= 로봇 변환을 고려한 nvblox 메시 생성 =========
@@ -1115,30 +914,7 @@ def create_mesh_with_robot_transformation_nvblox(rgb, depth, robot_mask, robot_s
     )
     
     # 4) nvblox 메시 생성
-    print(f"  Creating mesh from RGBD with {np.sum(depth_future > 0)} valid depth pixels")
     mesh, mapper = create_mesh_with_nvblox(depth_future, rgb_future, camera_intrinsics, voxel_size, max_integration_distance, return_mapper=True, mapper=mapper)
-    
-    # 디버깅: 생성된 mesh 정보
-    if mesh is not None:
-        print(f"  Generated mesh: {mesh.vertices().shape[0]} vertices, {mesh.triangles().shape[0]} triangles")
-        
-        # Mesh vertices 범위 확인
-        vertices = mesh.vertices().cpu().numpy()
-        mesh_min = np.min(vertices, axis=0)
-        mesh_max = np.max(vertices, axis=0)
-        print(f"  Mesh bounds: min={mesh_min}, max={mesh_max}")
-        
-        # Robot points가 mesh 범위 내에 있는지 확인
-        if len(robot_points_transformed) > 0:
-            robot_min = np.min(robot_points_transformed, axis=0)
-            robot_max = np.max(robot_points_transformed, axis=0)
-            robot_in_mesh = np.all(robot_min >= mesh_min - 0.1) and np.all(robot_max <= mesh_max + 0.1)
-            print(f"  Robot points within mesh bounds: {robot_in_mesh}")
-            if not robot_in_mesh:
-                print(f"  WARNING: Robot points may not be properly integrated into mesh!")
-    else:
-        print("  ERROR: Failed to generate mesh!")
-    
     return mesh, robot_points_original, robot_points_transformed, mapper
     
 
@@ -1213,7 +989,6 @@ def transform_robot_points_direct(rgb, depth, robot_mask, robot_se3_transform, c
 def add_transformed_robot_to_rgbd_direct(rgb_without_robot, depth_without_robot, robot_points_transformed, camera_intrinsics):
     """
     변환된 로봇 포인트들을 새로운 RGBD에 직접 추가 (numpy array 기반)
-    더 매끄러운 mesh를 위해 주변 픽셀도 함께 채움
     """
     if len(robot_points_transformed) == 0:
         print("Warning: No transformed robot points to add")
@@ -1230,9 +1005,6 @@ def add_transformed_robot_to_rgbd_direct(rgb_without_robot, depth_without_robot,
     added_pixels = 0
     valid_points = 0
     
-    # 매끄러운 mesh를 위한 주변 픽셀 채우기 설정
-    fill_radius = 2  # 주변 2픽셀 반경까지 채움
-    
     for point in robot_points_transformed:
         x_3d, y_3d, z_3d = point
         
@@ -1244,80 +1016,14 @@ def add_transformed_robot_to_rgbd_direct(rgb_without_robot, depth_without_robot,
             
             # 이미지 범위 내에 있는지 확인
             if 0 <= x_pixel < depth_future.shape[1] and 0 <= y_pixel < depth_future.shape[0]:
-                # 주변 픽셀들도 함께 채우기 (매끄러운 mesh를 위해)
-                for dy in range(-fill_radius, fill_radius + 1):
-                    for dx in range(-fill_radius, fill_radius + 1):
-                        nx, ny = x_pixel + dx, y_pixel + dy
-                        
-                        # 이미지 범위 내 확인
-                        if 0 <= nx < depth_future.shape[1] and 0 <= ny < depth_future.shape[0]:
-                            # 거리에 따른 depth 보정 (원근감 고려)
-                            distance_factor = np.sqrt(dx*dx + dy*dy) / fill_radius
-                            adjusted_depth = z_3d + distance_factor * 0.01  # 1cm씩 증가
-                            
-                            # 기존 depth가 0이거나 robot이 더 가까우면 업데이트
-                            if depth_future[ny, nx] == 0 or depth_future[ny, nx] > adjusted_depth:
-                                depth_future[ny, nx] = adjusted_depth
-                                # 로봇 색상 (회색)으로 설정
-                                rgb_future[ny, nx] = [0.5, 0.5, 0.5]
-                                added_pixels += 1
-                            else:
-                                # 기존 depth가 더 가까워도 robot 영역임을 표시하기 위해 색상만 변경
-                                rgb_future[ny, nx] = [0.5, 0.5, 0.5]
-                                added_pixels += 1
+                # 기존 depth보다 가까우면 업데이트
+                if depth_future[y_pixel, x_pixel] == 0 or depth_future[y_pixel, x_pixel] > z_3d:
+                    depth_future[y_pixel, x_pixel] = z_3d
+                    # 로봇 색상 (회색)으로 설정
+                    rgb_future[y_pixel, x_pixel] = [0.5, 0.5, 0.5]
+                    added_pixels += 1
     
     print(f"  Added {added_pixels} robot pixels from {valid_points} valid transformed points")
-    
-    # 매끄러운 mesh를 위한 morphological operations 적용
-    if added_pixels > 0:
-        try:
-            from scipy import ndimage
-            
-            # Robot 영역 마스크 생성 (회색 픽셀들)
-            robot_mask = np.all(rgb_future == [0.5, 0.5, 0.5], axis=2)
-            
-            # Morphological closing (구멍 메우기)
-            kernel_size = 3
-            kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
-            robot_mask_closed = ndimage.binary_closing(robot_mask, structure=kernel)
-            
-            # Closing으로 추가된 영역에 depth 값 보간
-            new_robot_pixels = robot_mask_closed & ~robot_mask
-            if np.any(new_robot_pixels):
-                # 새로운 robot 픽셀들에 대해 주변 depth 값으로 보간
-                for y, x in np.argwhere(new_robot_pixels):
-                    # 주변 유효한 depth 값들 찾기
-                    y_min, y_max = max(0, y-2), min(depth_future.shape[0], y+3)
-                    x_min, x_max = max(0, x-2), min(depth_future.shape[1], x+3)
-                    neighborhood = depth_future[y_min:y_max, x_min:x_max]
-                    valid_depths = neighborhood[neighborhood > 0]
-                    
-                    if len(valid_depths) > 0:
-                        # 주변 depth 값의 평균으로 보간
-                        interpolated_depth = np.mean(valid_depths)
-                        depth_future[y, x] = interpolated_depth
-                        rgb_future[y, x] = [0.5, 0.5, 0.5]
-                        added_pixels += 1
-                
-                print(f"  Morphological closing added {np.sum(new_robot_pixels)} pixels")
-        except ImportError:
-            print("  scipy not available, skipping morphological operations")
-    
-    # 디버깅: 변환된 robot points의 범위와 추가된 픽셀 분포 확인
-    if len(robot_points_transformed) > 0:
-        robot_min = np.min(robot_points_transformed, axis=0)
-        robot_max = np.max(robot_points_transformed, axis=0)
-        print(f"  Transformed robot 3D bounds: min={robot_min}, max={robot_max}")
-        
-        # 추가된 픽셀들의 depth 범위 확인
-        if added_pixels > 0:
-            added_depth_values = depth_future[depth_future != depth_without_robot]
-            if len(added_depth_values) > 0:
-                print(f"  Added depth range: {np.min(added_depth_values):.3f} to {np.max(added_depth_values):.3f}m")
-            else:
-                print("  WARNING: No depth values were actually added!")
-        else:
-            print("  WARNING: No robot pixels were added to RGBD!")
     
     return rgb_future, depth_future
 
@@ -1492,7 +1198,7 @@ def main():
     print(f"[Query] pixel=({uq},{vq}), depth={dq:.4f} m, world_pos={Xw_q}")
     print(f"Query point selection time: {query_end_time - query_start_time:.4f} seconds")
 
-    # 5) 각 mesh별로 로봇 변환을 고려한 nvblox 메시 생성
+    # 5) 각 viewpoint별로 로봇 변환을 고려한 nvblox 메시 생성
     print("\n=== 4. nvblox Mesh Generation with Robot Transformation ===")
     mesh_start_time = time.time()
     
@@ -1500,24 +1206,27 @@ def main():
     robot_mask = create_robot_segmentation_mask_demo(rgb_resized.shape)
     print(f"Robot mask created: {np.sum(robot_mask)} pixels")
     
-    # L개의 로봇 SE(3) 변환 생성 (각 column index i에 대응)
+    # 각 viewpoint별로 로봇 SE(3) 변환 생성
     robot_se3_transforms = create_robot_se3_transforms_demo(CANDIDATE_VIEWPOINTS)
     print(f"Generated {len(robot_se3_transforms)} robot SE(3) transforms")
     for i, transform in enumerate(robot_se3_transforms):
         print(f"  Transform {i+1}: translation={transform[:3, 3]}")
     
-    # L개의 mesh 생성 (각 column index i에 대응하는 robot transform으로)
+    # 각 viewpoint별로 로봇 변환된 메시와 매퍼 생성
     meshes_with_robot = []
     mappers_with_robot = []
     robot_points_original_list = []
     robot_points_transformed_list = []
     
-    # 각 mesh마다 독립적인 mapper 생성 (robot transform이 제대로 반영되도록)
-    for i, robot_transform in enumerate(robot_se3_transforms):
-        print(f"  Creating mesh {i+1} with robot transform: translation={robot_transform[:3, 3]}")
+    # Mapper 재사용을 위한 공유 mapper 생성
+    shared_mapper = None
+    
+    for i, (viewpoint, robot_transform) in enumerate(zip(CANDIDATE_VIEWPOINTS, robot_se3_transforms)):
+        print(f"\nCreating mesh for viewpoint {i+1}: {viewpoint}")
+        print(f"  Using robot transform: translation={robot_transform[:3, 3]}")
         start = time.time()
         mesh_with_robot, robot_points_original, robot_points_transformed, mapper_robot = create_mesh_with_robot_transformation_nvblox(
-            rgb_resized, depth_m, robot_mask, robot_transform, K_adjusted, voxel_size=VOXEL_SIZE, max_integration_distance=5.0, mapper=None  # 독립적인 mapper 사용
+            rgb_resized, depth_m, robot_mask, robot_transform, K_adjusted, voxel_size=VOXEL_SIZE, max_integration_distance=5.0,  mapper=shared_mapper
         )
         print(f"  nvblox robot transformed mesh creation time: {time.time() - start:.4f} seconds")
         meshes_with_robot.append(mesh_with_robot)
@@ -1525,6 +1234,10 @@ def main():
         robot_points_original_list.append(robot_points_original)
         robot_points_transformed_list.append(robot_points_transformed)
         print(f"  Mesh {i+1}: {mesh_with_robot.vertices().shape[0]} vertices, {mesh_with_robot.triangles().shape[0]} triangles")
+        
+        # 첫 번째 iteration에서 shared_mapper 설정
+        if shared_mapper is None:
+            shared_mapper = mapper_robot
         
         # 디버깅: 변환된 로봇 포인트들의 중심점 확인
         if len(robot_points_transformed) > 0:
@@ -1543,117 +1256,61 @@ def main():
     print(f"Original nvblox mesh created in {original_mesh_end_time - original_mesh_start_time:.4f} seconds")
     print(f"Original mesh has {mesh_original.vertices().shape[0]} vertices and {mesh_original.triangles().shape[0]} triangles")
     
-    # 6) M개의 viewpoint set에 대해 각 mesh별로 visibility 체크
+    # 6) 각 candidate viewpoint에서 nvblox ESDF 기반 visibility 체크 (각 viewpoint별로 매칭)
     print("\n=== 5. nvblox ESDF Visibility Check ===")
     visibility_start_time = time.time()
     
-    print(f"Processing {M} viewpoint sets, each with {L} viewpoints...")
-    print(f"Total viewpoints to check: {M} x {L} = {M*L}")
+    print(f"Processing {len(CANDIDATE_VIEWPOINTS)} viewpoints with individual robot transforms...")
     
-    # [M, L] 모양의 visibility 결과 저장
-    visibility_results = np.zeros((M, L), dtype=bool)  # True if visible, False if occluded
-    hit_distances = np.zeros((M, L), dtype=np.float64)  # Hit distances for each viewpoint
+    # 각 viewpoint별로 개별적으로 visibility 체크
+    batch_results_robot = []
+    batch_results_original = []
     
-    # 각 mesh별로 RaycastingScene을 미리 생성 (성능 최적화)
-    print(f"\n=== Pre-creating RaycastingScenes for {L} meshes ===")
-    scene_creation_start_time = time.time()
-    raycasting_scenes = []
-    
-    for mesh_idx in range(L):
-        print(f"  Creating scene for mesh {mesh_idx + 1}...")
-        scene = create_raycasting_scene(meshes_with_robot[mesh_idx])
-        raycasting_scenes.append(scene)
-    
-    scene_creation_end_time = time.time()
-    print(f"All RaycastingScenes created in {scene_creation_end_time - scene_creation_start_time:.4f} seconds")
-    
-    denoising_steps = 5 # dscho temporary debug for SVDD
-    for diff_step in range(denoising_steps):
-        print('\n------------Denoising step ', diff_step, '------------\n')
-        # 각 mesh별로 (L개의 mesh) visibility 체크
-        for mesh_idx in range(L):  # mesh_idx는 column index i에 해당
-            print(f"\n=== Checking mesh {mesh_idx + 1} (column {mesh_idx}) ===")
-            current_mesh = meshes_with_robot[mesh_idx]
-            current_scene = raycasting_scenes[mesh_idx]
-            
-            # 현재 mesh_idx에 해당하는 column의 viewpoints들을 모음: CANDIDATE_VIEWPOINTS_MATRIX[:, mesh_idx]
-            viewpoints_for_this_mesh = CANDIDATE_VIEWPOINTS_MATRIX[:, mesh_idx]  # [M, 3] 모양
-            print(f"  Viewpoints for this mesh: {viewpoints_for_this_mesh.shape} (M viewpoints)")
-            
-            
-            # Batch raycasting 방식 (미리 생성된 scene 사용)
-            print(f"  Performing batch raycasting for {M} viewpoints...")
-            
-            # Batch raycasting을 위한 ray 생성
-            origins = viewpoints_for_this_mesh  # [M, 3] 모양
-            directions = Xw_q - origins  # [M, 3] 모양 - 각 viewpoint에서 query point로의 방향
-            distances = np.linalg.norm(directions, axis=1)  # [M] 모양 - 각 ray의 거리
-            directions = directions / distances[:, np.newaxis]  # 정규화된 방향 벡터 [M, 3]
-            
-            # 미리 생성된 scene을 사용한 batch raycasting 수행
-            batch_visible, batch_hit_distances = batch_raycasting_with_scene(
-                current_scene, origins, directions, distances-OFFSET_DISTANCE
-            )
-            
-            # 결과 저장
-            for set_idx in range(M):
-                visibility_results[set_idx, mesh_idx] = batch_visible[set_idx]
-                hit_distances[set_idx, mesh_idx] = batch_hit_distances[set_idx]
-                
-                print(f"    Set {set_idx + 1}: {viewpoints_for_this_mesh[set_idx]} -> {'VISIBLE' if batch_visible[set_idx] else 'OCCLUDED'} (hit: {batch_hit_distances[set_idx]:.3f}m)")
-            
+    for i, (viewpoint, mapper_robot_i) in enumerate(zip(CANDIDATE_VIEWPOINTS, mappers_with_robot)):
+        print(f"\nChecking viewpoint {i+1}: {viewpoint}")
+        
+        # 해당 viewpoint에서 query point까지의 거리 계산
+        distance = np.linalg.norm(Xw_q - viewpoint)
+        
+        # 로봇 변환된 메시로 visibility 체크 (Open3D tensor raycasting 사용)
+        print(f"  Robot-transformed mesh visibility check...")
+        visible_robot, hit_distance_robot, hit_point_robot = check_visibility_with_nvblox_mesh_raycast(
+            meshes_with_robot[i], viewpoint, Xw_q, distance
+        )
+        batch_results_robot.append((visible_robot, hit_distance_robot, hit_point_robot))
+        
+        # 원본 메시로 visibility 체크 (Open3D tensor raycasting 사용)
+        print(f"  Original mesh visibility check...")
+        visible_original, hit_distance_original, hit_point_original = check_visibility_with_nvblox_mesh_raycast(
+            mesh_original, viewpoint, Xw_q, distance
+        )
+        batch_results_original.append((visible_original, hit_distance_original, hit_point_original))
+        
+        print(f"  Results: Robot={visible_robot} (hit: {hit_distance_robot:.3f}m), Original={visible_original} (hit: {hit_distance_original:.3f}m)")
     
     visibility_end_time = time.time()
     print(f"\nnvblox ESDF visibility check time: {visibility_end_time - visibility_start_time:.4f} seconds")
     
-    # 7) Reward 계산 (visible=1, occluded=0)
-    print("\n=== 6. Reward Calculation ===")
-    reward_start_time = time.time()
-    
-    # [M, L] 모양의 reward 매트릭스 생성 (visible=1, occluded=0)
-    reward_matrix = visibility_results.astype(np.float64)
-    
-    print("Reward matrix (M x L):")
-    print("  M = viewpoint set index (row)")
-    print("  L = viewpoint index (column)")
-    print("  Value: 1.0 = visible, 0.0 = occluded")
-    print()
-    
-    for set_idx in range(M):
-        print(f"Viewpoint set {set_idx + 1}: {reward_matrix[set_idx]}")
-    
-    # 각 viewpoint set별로 최종 reward 계산 (L개의 viewpoint change에 따른 reward 합계)
-    final_rewards = np.sum(reward_matrix, axis=1)  # [M] 모양의 배열
-    print(f"\nFinal rewards for each viewpoint set:")
-    for set_idx in range(M):
-        print(f"  Set {set_idx + 1}: {final_rewards[set_idx]:.1f} (sum of {L} viewpoints)")
-    
-    print(f"\nFinal rewards array: {final_rewards}")
-    print(f"Total reward sum: {np.sum(final_rewards):.1f}")
-    
-    reward_end_time = time.time()
-    print(f"Reward calculation time: {reward_end_time - reward_start_time:.4f} seconds")
-    
-    # 결과 정리 (기존 코드와 호환성을 위해)
+    # 결과 정리
     results = []
     for i, (viewpoint, yaw_deg) in enumerate(zip(CANDIDATE_VIEWPOINTS, CANDIDATE_YAW_DEGS)):
-        # 첫 번째 viewpoint set의 결과를 사용 (기존 시각화 코드와 호환)
-        visible_robot = visibility_results[0, i] if i < L else False
-        hit_distance_robot = hit_distances[0, i] if i < L else 0.0
-        
-        # 각 viewpoint에서 query point까지의 거리 계산
-        distance_to_query = np.linalg.norm(Xw_q - viewpoint)
-        
-        result = {
-            'viewpoint': viewpoint,
-            'yaw_deg': yaw_deg,
-            'visible_robot': visible_robot,
-            'visible_original': visible_robot,  # 호환성을 위해 동일하게 설정
-            'hit_distance_robot': hit_distance_robot,
-            'hit_distance_original': hit_distance_robot,  # 호환성을 위해 동일하게 설정
-            'distance_to_query': distance_to_query
-        }
-        results.append(result)
+        if i < len(batch_results_robot):
+            visible_robot, hit_distance_robot, hit_point_robot = batch_results_robot[i]
+            visible_original, hit_distance_original, hit_point_original = batch_results_original[i]
+            
+            # 각 viewpoint에서 query point까지의 거리 계산
+            distance_to_query = np.linalg.norm(Xw_q - viewpoint)
+            
+            result = {
+                'viewpoint': viewpoint,
+                'yaw_deg': yaw_deg,
+                'visible_robot': visible_robot,
+                'visible_original': visible_original,
+                'hit_distance_robot': hit_distance_robot,
+                'hit_distance_original': hit_distance_original,
+                'distance_to_query': distance_to_query
+            }
+            results.append(result)
     
     # 결과 출력
     print("\n=== Visibility Check Results ===")
@@ -1668,8 +1325,8 @@ def main():
         if abs(result['hit_distance_original'] - result['hit_distance_robot']) > 0.01:
             print(f"  📏 Hit distance changed: {result['hit_distance_original']:.3f}m → {result['hit_distance_robot']:.3f}m")
 
-    # 8) 시각화
-    print("\n=== 7. Creating Visualizations ===")
+    # 7) 시각화
+    print("\n=== 6. Creating Visualizations ===")
     viz_start_time = time.time()
     
     import os
@@ -1714,107 +1371,29 @@ def main():
     plt.savefig("visibility_test_output/rgb_depth_query_with_robot_mask.png", dpi=150, bbox_inches='tight')
     plt.close()
     print("2D visualization with robot mask saved to: visibility_test_output/rgb_depth_query_with_robot_mask.png")
-    
-    # Reward 매트릭스 시각화
-    fig, ax = plt.subplots(1, 2, figsize=(15, 6))
-    
-    # Reward 매트릭스 히트맵
-    im1 = ax[0].imshow(reward_matrix, cmap='RdYlGn', vmin=0, vmax=1, aspect='auto')
-    ax[0].set_title('Reward Matrix (M x L)\nGreen=Visible(1), Red=Occluded(0)')
-    ax[0].set_xlabel('Viewpoint Index (L)')
-    ax[0].set_ylabel('Viewpoint Set Index (M)')
-    
-    # 컬러바 추가
-    cbar1 = plt.colorbar(im1, ax=ax[0], shrink=0.8)
-    cbar1.set_label('Reward (1.0=Visible, 0.0=Occluded)')
-    
-    # 각 셀에 값 표시
-    for i in range(M):
-        for j in range(L):
-            text = ax[0].text(j, i, f'{reward_matrix[i, j]:.0f}',
-                            ha="center", va="center", color="black", fontweight='bold')
-    
-    # 최종 reward 막대 그래프
-    bars = ax[1].bar(range(1, M+1), final_rewards, color=['skyblue', 'lightgreen', 'lightcoral'][:M])
-    ax[1].set_title('Final Rewards per Viewpoint Set')
-    ax[1].set_xlabel('Viewpoint Set Index (M)')
-    ax[1].set_ylabel('Total Reward')
-    ax[1].set_ylim(0, L + 0.5)
-    
-    # 각 막대 위에 값 표시
-    for i, reward in enumerate(final_rewards):
-        ax[1].text(i+1, reward + 0.1, f'{reward:.1f}', ha='center', va='bottom', fontweight='bold')
-    
-    plt.tight_layout()
-    plt.savefig("visibility_test_output/reward_analysis.png", dpi=150, bbox_inches='tight')
-    plt.close()
-    print("Reward analysis visualization saved to: visibility_test_output/reward_analysis.png")
 
-    # 3D 시각화 - 각 mesh별로 독립적인 시각화 생성
-    print("Creating individual 3D visualizations for each mesh...")
+    # 3D 시각화
+    print("Creating 3D visualization...")
     
-    # 각 mesh별로 시각화 생성
-    for mesh_idx in range(L):
-        print(f"Creating visualization for mesh {mesh_idx + 1}...")
-        
-        # 현재 mesh와 관련 데이터
-        current_mesh = meshes_with_robot[mesh_idx]
-        current_robot_points_original = robot_points_original_list[mesh_idx]
-        current_robot_points_transformed = robot_points_transformed_list[mesh_idx]
-        
-        # 현재 mesh에 대한 visibility 결과만 추출 (모든 viewpoint set에서)
-        current_mesh_results = []
-        for set_idx in range(M):
-            visible = visibility_results[set_idx, mesh_idx]
-            hit_distance = hit_distances[set_idx, mesh_idx]
-            viewpoint = CANDIDATE_VIEWPOINTS_MATRIX[set_idx, mesh_idx]
-            
-            # 각 viewpoint에서 query point까지의 거리 계산
-            distance_to_query = np.linalg.norm(Xw_q - viewpoint)
-            
-            result = {
-                'viewpoint': viewpoint,
-                'yaw_deg': 0.0,  # 기본값
-                'visible_robot': visible,
-                'visible_original': visible,  # 호환성을 위해 동일하게 설정
-                'hit_distance_robot': hit_distance,
-                'hit_distance_original': hit_distance,  # 호환성을 위해 동일하게 설정
-                'distance_to_query': distance_to_query
-            }
-            current_mesh_results.append(result)
-        
-        # 현재 mesh에 대한 시각화 생성
-        create_3d_visualization_plotly(
-            current_mesh, Xw_q, CANDIDATE_VIEWPOINTS_MATRIX[:, mesh_idx], current_mesh_results,
-            f"visibility_test_output/3d_visualization_mesh_{mesh_idx + 1}.html",
-            robot_mask, current_robot_points_original, current_robot_points_transformed
-        )
+    # 첫 번째 viewpoint의 로봇 변환된 메시를 대표로 사용 (시각화용)
+    idx = -1
+    representative_mesh = meshes_with_robot[idx]
+    representative_robot_points_original = robot_points_original_list[idx]
+    representative_robot_points_transformed = robot_points_transformed_list[idx]
     
-    # 원본 mesh와 비교를 위한 시각화 생성
-    print("Creating original mesh visualization for comparison...")
-    original_results = []
-    for i, viewpoint in enumerate(CANDIDATE_VIEWPOINTS):
-        # 원본 mesh에서는 모든 viewpoint가 visible하다고 가정 (실제로는 원본 mesh로 테스트해야 함)
-        original_results.append({
-            'viewpoint': viewpoint,
-            'yaw_deg': 0.0,
-            'visible_robot': True,  # 원본에서는 가정
-            'visible_original': True,
-            'hit_distance_robot': 0.0,
-            'hit_distance_original': 0.0,
-            'distance_to_query': np.linalg.norm(Xw_q - viewpoint)
-        })
+    # Plotly 기반 인터랙티브 3D 시각화 생성 (로봇 변환 고려)
+    create_3d_visualization_plotly(representative_mesh, Xw_q, CANDIDATE_VIEWPOINTS, results, 
+                                   "visibility_test_output/3d_visualization_with_robot.html",
+                                   robot_mask, representative_robot_points_original, representative_robot_points_transformed)
     
-    create_3d_visualization_plotly(
-        mesh_original, Xw_q, CANDIDATE_VIEWPOINTS, original_results,
-        "visibility_test_output/3d_visualization_original.html",
-        robot_mask, robot_points_original_list[0] if len(robot_points_original_list) > 0 else None, None
-    )
+    # 상세한 3D 시각화 생성 (로봇 변환 고려)
+    create_comprehensive_3d_visualization(representative_mesh, Xw_q, CANDIDATE_VIEWPOINTS, results,
+                                         "visibility_test_output/3d_comprehensive_with_robot.html")
     
-    # M개의 viewpoint set을 모두 보여주는 3D 시각화 생성
-    create_multi_viewpoint_set_3d_visualization(meshes_with_robot, Xw_q, CANDIDATE_VIEWPOINTS_MATRIX, 
-                                               visibility_results, final_rewards,
-                                               "visibility_test_output/3d_multi_viewpoint_sets.html")
+    # 원본과 비교를 위한 시각화도 생성
+    create_3d_visualization_plotly(mesh_original, Xw_q, CANDIDATE_VIEWPOINTS, results, 
+                                   "visibility_test_output/3d_visualization_original.html",
+                                   robot_mask, representative_robot_points_original, None)
     
     
     
@@ -1827,37 +1406,29 @@ def main():
 
     # 결과 요약
     print("\n=== Summary ===")
-    print(f"Configuration: M={M} viewpoint sets, L={L} viewpoints per set")
-    print(f"Total viewpoints processed: {M} x {L} = {M*L}")
+    visible_count_robot = sum(1 for r in results if r['visible_robot'])
+    visible_count_original = sum(1 for r in results if r['visible_original'])
+    total_count = len(results)
     
-    # 각 viewpoint set별 요약
-    print(f"\nViewpoint Set Analysis:")
-    for set_idx in range(M):
-        visible_count = np.sum(visibility_results[set_idx])
-        total_reward = final_rewards[set_idx]
-        print(f"  Set {set_idx + 1}: {visible_count}/{L} visible viewpoints, reward = {total_reward:.1f}")
+    print(f"Robot-transformed mesh method - Visible viewpoints: {visible_count_robot}/{total_count}")
+    print(f"Original mesh method - Visible viewpoints: {visible_count_original}/{total_count}")
     
-    # 전체 통계
-    total_visible = np.sum(visibility_results)
-    total_possible = M * L
-    overall_visibility_rate = total_visible / total_possible * 100
+    # 로봇 변환 효과 분석
+    visibility_changes = sum(1 for r in results if r['visible_original'] != r['visible_robot'])
+    print(f"\n🔄 Robot transformation changed visibility for {visibility_changes}/{total_count} viewpoints")
     
-    print(f"\nOverall Statistics:")
-    print(f"  Total visible viewpoints: {total_visible}/{total_possible} ({overall_visibility_rate:.1f}%)")
-    print(f"  Average reward per set: {np.mean(final_rewards):.2f}")
-    print(f"  Best performing set: Set {np.argmax(final_rewards) + 1} (reward: {np.max(final_rewards):.1f})")
-    print(f"  Worst performing set: Set {np.argmin(final_rewards) + 1} (reward: {np.min(final_rewards):.1f})")
-    
-    # Reward 매트릭스 요약
-    print(f"\nReward Matrix Summary:")
-    print(f"  Matrix shape: {reward_matrix.shape}")
-    print(f"  Total reward sum: {np.sum(final_rewards):.1f}")
-    print(f"  Reward variance: {np.var(final_rewards):.2f}")
-    
-    print("\nDetailed results (first viewpoint set only):")
+    print("\nDetailed results:")
     for i, result in enumerate(results):
         status_robot = "VISIBLE" if result['visible_robot'] else "OCCLUDED"
-        print(f"  Viewpoint {i+1}: {status_robot} (hit_distance: {result['hit_distance_robot']:.3f}m)")
+        status_original = "VISIBLE" if result['visible_original'] else "OCCLUDED"
+        print(f"  Viewpoint {i+1}:")
+        print(f"    Robot-transformed mesh: {status_robot} (hit_distance: {result['hit_distance_robot']:.3f}m)")
+        print(f"    Original mesh: {status_original} (hit_distance: {result['hit_distance_original']:.3f}m)")
+        
+        if result['visible_original'] != result['visible_robot']:
+            print(f"    🔄 Visibility changed due to robot transformation!")
+        if abs(result['hit_distance_original'] - result['hit_distance_robot']) > 0.01:
+            print(f"    📏 Hit distance changed: {result['hit_distance_original']:.3f}m → {result['hit_distance_robot']:.3f}m")
 
 
 if __name__ == "__main__":
