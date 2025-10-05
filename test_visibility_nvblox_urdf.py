@@ -558,8 +558,15 @@ CANDIDATE_VIEWPOINTS = [
 ]
 
 
-# 각 viewpoint의 yaw 회전 (deg)
-CANDIDATE_YAW_DEGS = [0.0, 0.0, 0.0, 0.0, 0.0]
+# 각 viewpoint의 카메라 회전 (roll, pitch, yaw in degrees)
+# 각 viewpoint마다 [roll, pitch, yaw] 형태로 정의
+CANDIDATE_ROTATIONS = [
+    [-0.05, 0.0, 0.0],    
+    [-0.10, 0.0, 0.0],    
+    [-0.15, 0.0, 0.0],    
+    [-0.20, 0.0, 0.0],    
+    [-0.25, 0.0, 0.0],    
+]
 
 # M개의 viewpoint set 생성 (예제에서는 M=3으로 설정)
 M = 10 # 3  # M개의 viewpoint set
@@ -574,6 +581,149 @@ print(f"Total viewpoints: {M} x {L} = {M*L}")
 # 현재는 예제로 기존 CANDIDATE_VIEWPOINTS를 M번 복사
 CANDIDATE_VIEWPOINTS_MATRIX = np.array([CANDIDATE_VIEWPOINTS for _ in range(M)])
 print(f"Candidate viewpoints matrix shape: {CANDIDATE_VIEWPOINTS_MATRIX.shape}")  # [M, L, 3]
+
+
+# ========= 동적 카메라 파라미터 계산 함수 =========
+def get_camera_parameters():
+    """
+    RESIZE 설정에 따라 동적으로 카메라 파라미터를 계산
+    
+    Returns:
+        tuple: (image_size, K_adjusted)
+            - image_size: (width, height)
+            - K_adjusted: 조정된 카메라 내부 파라미터 (3x3)
+    """
+    if RESIZE:
+        # 리사이즈된 이미지 크기와 내부 파라미터 사용
+        image_size = RESIZE_SIZE  # (width, height)
+        
+        # 원본 이미지 크기 (카메라 내부 파라미터와 일치해야 함)
+        original_width = 640  # 원본 카메라 해상도
+        original_height = 480
+        
+        # 리사이즈 비율 계산
+        scale_x = RESIZE_SIZE[0] / original_width
+        scale_y = RESIZE_SIZE[1] / original_height
+        
+        # 내부 파라미터 조정
+        K_adjusted = K.copy()
+        K_adjusted[0, 0] *= scale_x  # fx
+        K_adjusted[1, 1] *= scale_y  # fy
+        K_adjusted[0, 2] *= scale_x  # cx
+        K_adjusted[1, 2] *= scale_y  # cy
+        
+        print(f"Using resized camera parameters:")
+        print(f"  Image size: {image_size}")
+        print(f"  Scale factors: x={scale_x:.3f}, y={scale_y:.3f}")
+        print(f"  Adjusted K:\n{K_adjusted}")
+        
+    else:
+        # 원본 이미지 크기와 내부 파라미터 사용
+        image_size = (640, 480)  # 원본 카메라 해상도
+        K_adjusted = K.copy()
+        
+        print(f"Using original camera parameters:")
+        print(f"  Image size: {image_size}")
+        print(f"  Original K:\n{K_adjusted}")
+    
+    return image_size, K_adjusted
+
+
+# ========= 카메라 Frustum 체크 함수 =========
+def is_point_in_camera_frustum(point_3d, camera_position, camera_rotation_rpy, camera_intrinsics, image_size):
+    """
+    3D 포인트가 카메라 frustum 내에 있는지 체크
+    
+    Args:
+        point_3d: 3D 포인트 [x, y, z] (월드 좌표)
+        camera_position: 카메라 위치 [x, y, z] (월드 좌표)
+        camera_rotation_rpy: 카메라 회전 [roll, pitch, yaw] (degrees)
+        camera_intrinsics: 카메라 내부 파라미터 (3x3)
+        image_size: 이미지 크기 (width, height)
+    
+    Returns:
+        bool: 포인트가 frustum 내에 있으면 True
+    """
+    # 1. 월드 좌표를 카메라 좌표로 변환
+    point_3d = np.array(point_3d, dtype=np.float64)
+    camera_position = np.array(camera_position, dtype=np.float64)
+    
+    # 카메라 회전 행렬 생성 (RPY 순서)
+    roll, pitch, yaw = np.deg2rad(camera_rotation_rpy)
+    R_cam = R.from_euler('xyz', [roll, pitch, yaw]).as_matrix()
+    
+    # 월드 좌표를 카메라 좌표로 변환
+    point_cam = R_cam.T @ (point_3d - camera_position)
+    
+    # 2. 카메라 좌표에서 이미지 평면으로 투영
+    if point_cam[2] <= 0:  # 카메라 뒤쪽에 있으면 보이지 않음
+        return False
+    
+    # 투영
+    fx, fy = camera_intrinsics[0, 0], camera_intrinsics[1, 1]
+    cx, cy = camera_intrinsics[0, 2], camera_intrinsics[1, 2]
+    
+    u = fx * point_cam[0] / point_cam[2] + cx
+    v = fy * point_cam[1] / point_cam[2] + cy
+    
+    # 3. 이미지 경계 내에 있는지 체크
+    width, height = image_size
+    return 0 <= u < width and 0 <= v < height
+
+
+def create_camera_frustum_visualization(camera_position, camera_rotation_rpy, camera_intrinsics, image_size, max_distance=1.0):
+    """
+    카메라 frustum을 시각화하기 위한 8개 꼭짓점 생성
+    
+    Args:
+        camera_position: 카메라 위치 [x, y, z]
+        camera_rotation_rpy: 카메라 회전 [roll, pitch, yaw] (degrees)
+        camera_intrinsics: 카메라 내부 파라미터 (3x3)
+        image_size: 이미지 크기 (width, height)
+        max_distance: frustum의 최대 거리
+    
+    Returns:
+        frustum_vertices: frustum의 8개 꼭짓점 (8, 3)
+    """
+    # 카메라 회전 행렬 생성
+    roll, pitch, yaw = np.deg2rad(camera_rotation_rpy)
+    R_cam = R.from_euler('xyz', [roll, pitch, yaw]).as_matrix()
+    
+    # 카메라 내부 파라미터
+    fx, fy = camera_intrinsics[0, 0], camera_intrinsics[1, 1]
+    cx, cy = camera_intrinsics[0, 2], camera_intrinsics[1, 2]
+    width, height = image_size
+    
+    # 이미지 모서리 4개 점 (픽셀 좌표)
+    corners_2d = np.array([
+        [0, 0],           # 좌상단
+        [width, 0],       # 우상단
+        [width, height],  # 우하단
+        [0, height]       # 좌하단
+    ])
+    
+    # 각 거리에서 frustum 꼭짓점 계산
+    frustum_vertices = []
+    
+    # 카메라 위치 (근거리)
+    frustum_vertices.append(camera_position)
+    
+    # 원거리 frustum 꼭짓점들
+    for corner_2d in corners_2d:
+        u, v = corner_2d
+        
+        # 카메라 좌표에서 3D 방향 계산
+        x_cam = (u - cx) * max_distance / fx
+        y_cam = (v - cy) * max_distance / fy
+        z_cam = max_distance
+        
+        # 월드 좌표로 변환
+        point_cam = np.array([x_cam, y_cam, z_cam])
+        point_world = camera_position + R_cam @ point_cam
+        
+        frustum_vertices.append(point_world)
+    
+    return np.array(frustum_vertices)
 
 
 # ========= 유틸 함수 =========
@@ -1475,7 +1625,7 @@ def create_3d_visualization_plotly(mesh, query_point, candidate_viewpoints, resu
 
 
 
-def create_robot_3d_visualization_plotly(scene_mesh, robot_meshes, query_point, candidate_viewpoints, results, joint_angles, save_path, robot_viz=None, sdk_transform=None):
+def create_robot_3d_visualization_plotly(scene_mesh, robot_meshes, query_point, candidate_viewpoints, results, joint_angles, save_path, robot_viz=None, sdk_transform=None, image_size=None, K_adjusted=None):
     """
     Plotly를 사용한 로봇과 scene을 포함한 인터랙티브 3D 시각화 생성
     """
@@ -1757,33 +1907,70 @@ def create_robot_3d_visualization_plotly(scene_mesh, robot_meshes, query_point, 
         showlegend=True
     ))
     
-    # 4. 각 viewpoint와 Line of Sight 표시
+    # 4. 각 viewpoint와 카메라 frustum 표시
     for i, (viewpoint, result) in enumerate(zip(candidate_viewpoints, results)):
-        # Viewpoint 표시
+        # 카메라 frustum 생성
+        camera_rotation = result.get('camera_rotation', [0.0, 0.0, 0.0])
+        # 함수 파라미터로 전달된 카메라 파라미터 사용
+        max_distance = 1.0  # frustum 최대 거리
+        
+        frustum_vertices = create_camera_frustum_visualization(
+            viewpoint, camera_rotation, K_adjusted, image_size, max_distance
+        )
+        
+        # 카메라 위치 (frustum의 첫 번째 점)
+        camera_pos = frustum_vertices[0]
         viewpoint_color = 'green' if result['visible_robot'] else 'red'
+        
+        # 카메라 위치 표시
         fig.add_trace(go.Scatter3d(
-            x=[viewpoint[0]],
-            y=[viewpoint[1]],
-            z=[viewpoint[2]],
+            x=[camera_pos[0]],
+            y=[camera_pos[1]],
+            z=[camera_pos[2]],
             mode='markers',
             marker=dict(
-                size=8,
+                size=10,
                 color=viewpoint_color,
-                symbol='circle',
+                symbol='diamond',
                 line=dict(width=2, color='darkgreen' if result['visible_robot'] else 'darkred')
             ),
-            name=f'Viewpoint {i+1} ({result["visible_robot"] and "VISIBLE" or "OCCLUDED"})',
+            name=f'Camera {i+1} ({result["visible_robot"] and "VISIBLE" or "OCCLUDED"})',
             showlegend=True
         ))
         
-        # Line of Sight 표시
+        # 카메라 frustum 표시 (wireframe)
+        # Frustum의 8개 꼭짓점을 연결하는 선들
+        frustum_edges = [
+            # 카메라 위치에서 4개 원거리 꼭짓점으로의 선
+            [0, 1], [0, 2], [0, 3], [0, 4],
+            # 원거리 4개 꼭짓점을 연결하는 사각형
+            [1, 2], [2, 3], [3, 4], [4, 1]
+        ]
+        
+        for edge in frustum_edges:
+            start_idx, end_idx = edge
+            fig.add_trace(go.Scatter3d(
+                x=[frustum_vertices[start_idx, 0], frustum_vertices[end_idx, 0]],
+                y=[frustum_vertices[start_idx, 1], frustum_vertices[end_idx, 1]],
+                z=[frustum_vertices[start_idx, 2], frustum_vertices[end_idx, 2]],
+                mode='lines',
+                line=dict(
+                    color=viewpoint_color,
+                    width=3,
+                    dash='dot'
+                ),
+                name=f'Frustum {i+1}' if edge == frustum_edges[0] else None,
+                showlegend=True if edge == frustum_edges[0] else False
+            ))
+        
+        # Line of Sight 표시 (카메라에서 query point로)
         los_color = 'green' if result['visible_robot'] else 'red'
         los_style = 'solid' if result['visible_robot'] else 'dash'
         
         fig.add_trace(go.Scatter3d(
-            x=[viewpoint[0], query_point[0]],
-            y=[viewpoint[1], query_point[1]],
-            z=[viewpoint[2], query_point[2]],
+            x=[camera_pos[0], query_point[0]],
+            y=[camera_pos[1], query_point[1]],
+            z=[camera_pos[2], query_point[2]],
             mode='lines',
             line=dict(
                 color=los_color,
@@ -1828,7 +2015,7 @@ def create_robot_3d_visualization_plotly(scene_mesh, robot_meshes, query_point, 
     print(f"Robot 3D visualization saved to: {save_path}")
 
 
-def create_multi_robot_viewpoint_set_3d_visualization(scene_mesh, robot_meshes_list, query_point, viewpoint_matrix, visibility_results, final_rewards, save_path, robot_viz=None, robot_joint_angles_list=None):
+def create_multi_robot_viewpoint_set_3d_visualization(scene_mesh, robot_meshes_list, query_point, viewpoint_matrix, visibility_results, final_rewards, save_path, robot_viz=None, robot_joint_angles_list=None, image_size=None, K_adjusted=None):
     """
     M개의 robot viewpoint set을 모두 보여주는 3D 시각화
     """
@@ -1883,28 +2070,51 @@ def create_multi_robot_viewpoint_set_3d_visualization(scene_mesh, robot_meshes_l
             showlegend=False
         ), row=1, col=set_idx+1)
         
-        # 현재 set의 viewpoints 표시
+        # 현재 set의 viewpoints 표시 (카메라 frustum으로)
         for viewpoint_idx in range(L):
             viewpoint = viewpoint_matrix[set_idx, viewpoint_idx]
             visible = visibility_results[set_idx, viewpoint_idx]
+            camera_rotation = CANDIDATE_ROTATIONS[viewpoint_idx]
+            
+            # 카메라 frustum 생성
+            # 함수 파라미터로 전달된 카메라 파라미터 사용
+            max_distance = 0.5  # multi-view에서는 더 작은 frustum
+            frustum_vertices = create_camera_frustum_visualization(
+                viewpoint, camera_rotation, K_adjusted, image_size, max_distance
+            )
             
             viewpoint_color = 'green' if visible else 'red'
+            
+            # 카메라 위치 표시
+            camera_pos = frustum_vertices[0]
             fig.add_trace(go.Scatter3d(
-                x=[viewpoint[0]], y=[viewpoint[1]], z=[viewpoint[2]],
+                x=[camera_pos[0]], y=[camera_pos[1]], z=[camera_pos[2]],
                 mode='markers',
-                marker=dict(size=6, color=viewpoint_color, symbol='circle'),
-                name=f'VP{viewpoint_idx+1}',
+                marker=dict(size=4, color=viewpoint_color, symbol='diamond'),
+                name=f'Cam{viewpoint_idx+1}',
                 showlegend=False
             ), row=1, col=set_idx+1)
+            
+            # 간단한 frustum 표시 (카메라에서 4개 방향으로의 선만)
+            for i in range(1, 5):  # 1, 2, 3, 4 (원거리 꼭짓점들)
+                fig.add_trace(go.Scatter3d(
+                    x=[frustum_vertices[0, 0], frustum_vertices[i, 0]],
+                    y=[frustum_vertices[0, 1], frustum_vertices[i, 1]],
+                    z=[frustum_vertices[0, 2], frustum_vertices[i, 2]],
+                    mode='lines',
+                    line=dict(color=viewpoint_color, width=1, dash='dot'),
+                    name=f'Frustum{viewpoint_idx+1}' if i == 1 else None,
+                    showlegend=False
+                ), row=1, col=set_idx+1)
             
             # Line of Sight 표시
             los_color = 'green' if visible else 'red'
             los_style = 'solid' if visible else 'dash'
             
             fig.add_trace(go.Scatter3d(
-                x=[viewpoint[0], query_point[0]],
-                y=[viewpoint[1], query_point[1]],
-                z=[viewpoint[2], query_point[2]],
+                x=[camera_pos[0], query_point[0]],
+                y=[camera_pos[1], query_point[1]],
+                z=[camera_pos[2], query_point[2]],
                 mode='lines',
                 line=dict(color=los_color, width=2, dash=los_style),
                 name=f'LoS{viewpoint_idx+1}',
@@ -2476,20 +2686,23 @@ def main():
         
         # 홈 포지션으로 초기화
         robot_viz.set_joint_angles([0, 0, 0, 0, 0, 0])
+
+        # dscho debug
+        gripper_angle = -np.pi/2 # unit : (radian), 0 closed, -1 open (should check the maximum radian values of the robot)
         
         # Inverse Kinematics로 조인트 각도 계산
-        ik_success = robot_viz.solve_inverse_kinematics(end_effector_pose, gripper_angle=0.0)
+        ik_success = robot_viz.solve_inverse_kinematics(end_effector_pose, gripper_angle=gripper_angle)
         
         if ik_success:
             # Forward Kinematics 비교 (첫 번째 로봇에 대해서만)
             if i == 0:
                 print(f"\n  === Forward Kinematics 비교 (Robot {i+1}) ===")
-                sdk_result, urdf_result = robot_viz.compare_forward_kinematics(gripper_angle=0.0)
+                sdk_result, urdf_result = robot_viz.compare_forward_kinematics(gripper_angle=gripper_angle)
                 if sdk_result is not None:
                     sdk_transform_for_viz = sdk_result
             
             # 로봇의 모든 링크 메시를 월드 좌표계로 변환하여 가져오기
-            robot_meshes = robot_viz.get_robot_meshes_in_world(gripper_angle=0.0)
+            robot_meshes = robot_viz.get_robot_meshes_in_world(gripper_angle=gripper_angle)
             robot_meshes_list.append(robot_meshes)
             robot_joint_angles_list.append(robot_viz.joint_angles.copy())
             
@@ -2508,6 +2721,10 @@ def main():
     # 6) M개의 viewpoint set에 대해 각 robot별로 visibility 체크
     print("\n=== 5. URDF-based Robot Visibility Check ===")
     visibility_start_time = time.time()
+    
+    # 카메라 파라미터를 한 번만 계산 (성능 최적화)
+    print("\nCalculating camera parameters...")
+    image_size, K_adjusted = get_camera_parameters()
     
     print(f"Processing {M} viewpoint sets, each with {L} viewpoints...")
     print(f"Total viewpoints to check: {M} x {L} = {M*L}")
@@ -2546,23 +2763,49 @@ def main():
         # Batch raycasting 방식 (미리 생성된 scene 사용)
         print(f"  Performing batch raycasting for {M} viewpoints...")
         
-        # Batch raycasting을 위한 ray 생성
-        origins = viewpoints_for_this_robot  # [M, 3] 모양
-        directions = Xw_q - origins  # [M, 3] 모양 - 각 viewpoint에서 query point로의 방향
-        distances = np.linalg.norm(directions, axis=1)  # [M] 모양 - 각 ray의 거리
-        directions = directions / distances[:, np.newaxis]  # 정규화된 방향 벡터 [M, 3]
-        
-        # 미리 생성된 scene을 사용한 batch raycasting 수행
-        batch_visible, batch_hit_distances = batch_raycasting_with_scene(
-            current_scene, origins, directions, distances-OFFSET_DISTANCE
-        )
-        
-        # 결과 저장
+        # 각 viewpoint에 대해 LOS 체크와 카메라 frustum 체크 수행
         for set_idx in range(M):
-            visibility_results[set_idx, robot_idx] = batch_visible[set_idx]
-            hit_distances[set_idx, robot_idx] = batch_hit_distances[set_idx]
+            viewpoint = viewpoints_for_this_robot[set_idx]
+            camera_rotation = CANDIDATE_ROTATIONS[robot_idx]  # [roll, pitch, yaw] in degrees
             
-            print(f"    Set {set_idx + 1}: {viewpoints_for_this_robot[set_idx]} -> {'VISIBLE' if batch_visible[set_idx] else 'OCCLUDED'} (hit: {batch_hit_distances[set_idx]:.3f}m)")
+            # 1. LOS 체크 (기존 raycasting)
+            direction = Xw_q - viewpoint
+            distance = np.linalg.norm(direction)
+            direction_normalized = direction / distance
+            
+            # 단일 ray에 대한 raycasting
+            origins_single = viewpoint.reshape(1, 3)
+            directions_single = direction_normalized.reshape(1, 3)
+            distances_single = np.array([distance - OFFSET_DISTANCE])
+            
+            los_visible, los_hit_distances = batch_raycasting_with_scene(
+                current_scene, origins_single, directions_single, distances_single
+            )
+            los_visible = los_visible[0]
+            los_hit_distance = los_hit_distances[0]
+            
+            # 2. 카메라 frustum 체크
+            # 미리 계산된 카메라 파라미터 사용
+            frustum_visible = is_point_in_camera_frustum(
+                Xw_q, viewpoint, camera_rotation, K_adjusted, image_size
+            )
+            
+            # 3. 최종 visibility: LOS 체크와 frustum 체크를 모두 통과해야 함
+            final_visible = los_visible and frustum_visible
+            
+            # 결과 저장
+            visibility_results[set_idx, robot_idx] = final_visible
+            hit_distances[set_idx, robot_idx] = los_hit_distance
+            
+            # 상세 로그 출력
+            los_status = "LOS_OK" if los_visible else "LOS_BLOCKED"
+            frustum_status = "FRUSTUM_OK" if frustum_visible else "FRUSTUM_OUT"
+            final_status = "VISIBLE" if final_visible else "OCCLUDED"
+            
+            print(f"    Set {set_idx + 1}: {viewpoint}")
+            print(f"      LOS: {los_status} (hit: {los_hit_distance:.3f}m)")
+            print(f"      Frustum: {frustum_status} (rotation: {camera_rotation})")
+            print(f"      Final: {final_status}")
     
     visibility_end_time = time.time()
     print(f"\nURDF-based robot visibility check time: {visibility_end_time - visibility_start_time:.4f} seconds")
@@ -2597,7 +2840,7 @@ def main():
     
     # 결과 정리 (기존 코드와 호환성을 위해)
     results = []
-    for i, (viewpoint, yaw_deg) in enumerate(zip(CANDIDATE_VIEWPOINTS, CANDIDATE_YAW_DEGS)):
+    for i, (viewpoint, camera_rotation) in enumerate(zip(CANDIDATE_VIEWPOINTS, CANDIDATE_ROTATIONS)):
         # 첫 번째 viewpoint set의 결과를 사용 (기존 시각화 코드와 호환)
         visible_robot = visibility_results[0, i] if i < L else False
         hit_distance_robot = hit_distances[0, i] if i < L else 0.0
@@ -2607,7 +2850,8 @@ def main():
         
         result = {
             'viewpoint': viewpoint,
-            'yaw_deg': yaw_deg,
+            'camera_rotation': camera_rotation,  # [roll, pitch, yaw] in degrees
+            'yaw_deg': camera_rotation[2],  # 호환성을 위해 yaw만 추출
             'visible_robot': visible_robot,
             'visible_original': visible_robot,  # 호환성을 위해 동일하게 설정
             'hit_distance_robot': hit_distance_robot,
@@ -2619,7 +2863,7 @@ def main():
     # 결과 출력
     print("\n=== Visibility Check Results ===")
     for i, result in enumerate(results):
-        print(f"\nViewpoint {i+1}: {result['viewpoint']}, yaw={result['yaw_deg']}°")
+        print(f"\nViewpoint {i+1}: {result['viewpoint']}, rotation={result['camera_rotation']}°")
         print(f"  Robot-transformed mesh: {'✓ VISIBLE' if result['visible_robot'] else '✗ OCCLUDED'} (hit_distance: {result['hit_distance_robot']:.3f}m)")
         print(f"  Original mesh: {'✓ VISIBLE' if result['visible_original'] else '✗ OCCLUDED'} (hit_distance: {result['hit_distance_original']:.3f}m)")
         
@@ -2749,7 +2993,7 @@ def main():
             mesh_original, current_robot_meshes, Xw_q, CANDIDATE_VIEWPOINTS_MATRIX[:, robot_idx], 
             current_robot_results, current_joint_angles,
             f"visibility_test_output/3d_visualization_robot_{robot_idx + 1}.html",
-            robot_viz, sdk_transform_for_viz if robot_idx == 0 else None
+            robot_viz, sdk_transform_for_viz if robot_idx == 0 else None, image_size, K_adjusted
         )
     
     # 원본 mesh와 비교를 위한 시각화 생성
@@ -2769,13 +3013,13 @@ def main():
     
     create_robot_3d_visualization_plotly(
         mesh_original, {}, Xw_q, CANDIDATE_VIEWPOINTS, original_results, np.zeros(6),
-        "visibility_test_output/3d_visualization_original.html", robot_viz, sdk_transform_for_viz
+        "visibility_test_output/3d_visualization_original.html", robot_viz, sdk_transform_for_viz, image_size, K_adjusted
     )
     
     # M개의 viewpoint set을 모두 보여주는 3D 시각화 생성
     create_multi_robot_viewpoint_set_3d_visualization(mesh_original, robot_meshes_list, Xw_q, CANDIDATE_VIEWPOINTS_MATRIX, 
                                                      visibility_results, final_rewards,
-                                                     "visibility_test_output/3d_multi_robot_viewpoint_sets.html", robot_viz, robot_joint_angles_list)
+                                                     "visibility_test_output/3d_multi_robot_viewpoint_sets.html", robot_viz, robot_joint_angles_list, image_size, K_adjusted)
     
     # RGB/Depth 렌더링 생성
     print("\nCreating robot RGB/Depth renderings...")
