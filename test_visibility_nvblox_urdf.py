@@ -388,6 +388,118 @@ class Z1RobotVisualizer:
                 world_meshes[link_name] = world_mesh
         
         return world_meshes
+    
+    def get_coordinate_frames(self, gripper_angle=0.0, frame_size=0.05, joint_angles=None):
+        """Forward kinematics 결과에서 각 링크의 좌표계를 반환"""
+        # 조인트 각도가 제공되면 임시로 설정
+        original_joint_angles = self.joint_angles.copy()
+        if joint_angles is not None:
+            self.joint_angles = np.array(joint_angles)
+        
+        # 전진기구학 계산
+        self.compute_forward_kinematics(gripper_angle)
+        
+        coordinate_frames = {}
+        
+        for link_name, transform in self.link_transforms.items():
+            if link_name == 'world':
+                continue
+                
+            # 좌표계 생성
+            origin = transform[:3, 3]
+            x_axis = transform[:3, 0] * frame_size
+            y_axis = transform[:3, 1] * frame_size
+            z_axis = transform[:3, 2] * frame_size
+            
+            coordinate_frames[link_name] = {
+                'origin': origin,
+                'x_axis': x_axis,
+                'y_axis': y_axis,
+                'z_axis': z_axis,
+                'transform': transform
+            }
+        
+        # 원래 조인트 각도 복원
+        if joint_angles is not None:
+            self.joint_angles = original_joint_angles
+        
+        return coordinate_frames
+    
+    def get_end_effector_pose(self, gripper_angle=0.0, joint_angles=None):
+        """End effector (gripper)의 pose를 반환"""
+        # 조인트 각도가 제공되면 임시로 설정
+        original_joint_angles = self.joint_angles.copy()
+        if joint_angles is not None:
+            self.joint_angles = np.array(joint_angles)
+        
+        # 전진기구학 계산
+        self.compute_forward_kinematics(gripper_angle)
+        
+        # End effector는 z1_GripperMover 또는 link06
+        result = None
+        if 'z1_GripperMover' in self.link_transforms:
+            result = self.link_transforms['z1_GripperMover']
+        elif 'link06' in self.link_transforms:
+            result = self.link_transforms['link06']
+        
+        # 원래 조인트 각도 복원
+        if joint_angles is not None:
+            self.joint_angles = original_joint_angles
+        
+        return result
+    
+    def compare_forward_kinematics(self, gripper_angle=0.0):
+        """Unitree SDK forwardKinematics와 URDF 기반 계산 결과를 비교"""
+        if self.arm_interface is None:
+            print("Unitree Z1 SDK가 초기화되지 않았습니다.")
+            return None
+        
+        # URDF 기반 전진기구학 계산
+        self.compute_forward_kinematics(gripper_angle)
+        
+        # Unitree SDK forwardKinematics 호출
+        try:
+            sdk_fk_result = self.arm_interface._ctrlComp.armModel.forwardKinematics(self.joint_angles, 6)
+            print(f"\n=== Forward Kinematics 비교 ===")
+            print(f"조인트 각도: {self.joint_angles}")
+            print(f"SDK forwardKinematics 결과 (link 6):")
+            print(f"  Translation: {sdk_fk_result[:3, 3]}")
+            print(f"  Rotation Matrix:")
+            print(f"    {sdk_fk_result[0, :3]}")
+            print(f"    {sdk_fk_result[1, :3]}")
+            print(f"    {sdk_fk_result[2, :3]}")
+            
+            # SDK 결과는 이미 4x4 변환 행렬
+            sdk_transform = sdk_fk_result
+            
+            print(f"\nURDF 기반 계산 결과:")
+            for link_name, transform in self.link_transforms.items():
+                if link_name == 'world':
+                    continue
+                print(f"  {link_name}:")
+                print(f"    Translation: {transform[:3, 3]}")
+                print(f"    Rotation Matrix:")
+                print(f"      {transform[0, :3]}")
+                print(f"      {transform[1, :3]}")
+                print(f"      {transform[2, :3]}")
+                
+                # SDK 결과와의 거리 계산
+                translation_diff = np.linalg.norm(transform[:3, 3] - sdk_transform[:3, 3])
+                rotation_diff = np.linalg.norm(transform[:3, :3] - sdk_transform[:3, :3])
+                
+                print(f"    SDK와의 차이:")
+                print(f"      Translation 차이: {translation_diff:.6f}m")
+                print(f"      Rotation 차이: {rotation_diff:.6f}")
+                
+                # 가장 가까운 링크 찾기
+                if translation_diff < 0.001:  # 1mm 이내
+                    print(f"    *** {link_name}이 SDK 결과와 가장 가깝습니다! ***")
+            
+            return sdk_transform, self.link_transforms
+            
+        except Exception as e:
+            print(f"SDK forwardKinematics 호출 오류: {e}")
+            return None, self.link_transforms
 
 
 # ========= 사용자 설정 =========
@@ -1363,7 +1475,7 @@ def create_3d_visualization_plotly(mesh, query_point, candidate_viewpoints, resu
 
 
 
-def create_robot_3d_visualization_plotly(scene_mesh, robot_meshes, query_point, candidate_viewpoints, results, joint_angles, save_path):
+def create_robot_3d_visualization_plotly(scene_mesh, robot_meshes, query_point, candidate_viewpoints, results, joint_angles, save_path, robot_viz=None, sdk_transform=None):
     """
     Plotly를 사용한 로봇과 scene을 포함한 인터랙티브 3D 시각화 생성
     """
@@ -1455,7 +1567,181 @@ def create_robot_3d_visualization_plotly(scene_mesh, robot_meshes, query_point, 
                 ))
                 color_idx += 1
     
-    # 3. 쿼리 포인트 표시
+    
+    # Forward kinematics 결과의 각 링크 좌표계 표시
+    if robot_viz is not None:
+        coordinate_frames = robot_viz.get_coordinate_frames(frame_size=0.03, joint_angles=joint_angles)
+        
+        for link_name, frame_data in coordinate_frames.items():
+            origin = frame_data['origin']
+            x_axis = frame_data['x_axis']
+            y_axis = frame_data['y_axis']
+            z_axis = frame_data['z_axis']
+            
+            # X축 (빨간색)
+            fig.add_trace(go.Scatter3d(
+                x=[origin[0], origin[0] + x_axis[0]],
+                y=[origin[1], origin[1] + x_axis[1]],
+                z=[origin[2], origin[2] + x_axis[2]],
+                mode='lines+markers',
+                line=dict(color='red', width=4),
+                marker=dict(size=3, color='red'),
+                name=f'{link_name} X-axis',
+                showlegend=False
+            ))
+            
+            # Y축 (초록색)
+            fig.add_trace(go.Scatter3d(
+                x=[origin[0], origin[0] + y_axis[0]],
+                y=[origin[1], origin[1] + y_axis[1]],
+                z=[origin[2], origin[2] + y_axis[2]],
+                mode='lines+markers',
+                line=dict(color='green', width=4),
+                marker=dict(size=3, color='green'),
+                name=f'{link_name} Y-axis',
+                showlegend=False
+            ))
+            
+            # Z축 (파란색)
+            fig.add_trace(go.Scatter3d(
+                x=[origin[0], origin[0] + z_axis[0]],
+                y=[origin[1], origin[1] + z_axis[1]],
+                z=[origin[2], origin[2] + z_axis[2]],
+                mode='lines+markers',
+                line=dict(color='blue', width=4),
+                marker=dict(size=3, color='blue'),
+                name=f'{link_name} Z-axis',
+                showlegend=False
+            ))
+            
+            # 링크 이름 라벨
+            fig.add_trace(go.Scatter3d(
+                x=[origin[0] + 0.01],
+                y=[origin[1] + 0.01],
+                z=[origin[2] + 0.01],
+                mode='text',
+                text=[link_name],
+                textfont=dict(size=10, color='black'),
+                name=f'{link_name} label',
+                showlegend=False
+            ))
+        
+        # End effector pose 강조 표시
+        end_effector_pose = robot_viz.get_end_effector_pose(joint_angles=joint_angles)
+        if end_effector_pose is not None:
+            ee_origin = end_effector_pose[:3, 3]
+            ee_x = end_effector_pose[:3, 0] * 0.05
+            ee_y = end_effector_pose[:3, 1] * 0.05
+            ee_z = end_effector_pose[:3, 2] * 0.05
+            
+            # End effector 좌표계 (더 굵게)
+            fig.add_trace(go.Scatter3d(
+                x=[ee_origin[0], ee_origin[0] + ee_x[0]],
+                y=[ee_origin[1], ee_origin[1] + ee_x[1]],
+                z=[ee_origin[2], ee_origin[2] + ee_x[2]],
+                mode='lines+markers',
+                line=dict(color='red', width=8),
+                marker=dict(size=5, color='red'),
+                name='End Effector X-axis',
+                showlegend=True
+            ))
+            
+            fig.add_trace(go.Scatter3d(
+                x=[ee_origin[0], ee_origin[0] + ee_y[0]],
+                y=[ee_origin[1], ee_origin[1] + ee_y[1]],
+                z=[ee_origin[2], ee_origin[2] + ee_y[2]],
+                mode='lines+markers',
+                line=dict(color='green', width=8),
+                marker=dict(size=5, color='green'),
+                name='End Effector Y-axis',
+                showlegend=True
+            ))
+            
+            fig.add_trace(go.Scatter3d(
+                x=[ee_origin[0], ee_origin[0] + ee_z[0]],
+                y=[ee_origin[1], ee_origin[1] + ee_z[1]],
+                z=[ee_origin[2], ee_origin[2] + ee_z[2]],
+                mode='lines+markers',
+                line=dict(color='blue', width=8),
+                marker=dict(size=5, color='blue'),
+                name='End Effector Z-axis',
+                showlegend=True
+            ))
+            
+            # End effector 위치 표시
+            fig.add_trace(go.Scatter3d(
+                x=[ee_origin[0]],
+                y=[ee_origin[1]],
+                z=[ee_origin[2]],
+                mode='markers',
+                marker=dict(
+                    size=8,
+                    color='yellow',
+                    symbol='diamond',
+                    line=dict(width=2, color='orange')
+                ),
+                name='End Effector Position',
+                showlegend=True
+            ))
+    
+    # SDK forwardKinematics 결과 표시 (비교용)
+    if sdk_transform is not None:
+        sdk_origin = sdk_transform[:3, 3]
+        sdk_x = sdk_transform[:3, 0] * 0.05
+        sdk_y = sdk_transform[:3, 1] * 0.05
+        sdk_z = sdk_transform[:3, 2] * 0.05
+        
+        # SDK 좌표계 (점선으로 표시)
+        fig.add_trace(go.Scatter3d(
+            x=[sdk_origin[0], sdk_origin[0] + sdk_x[0]],
+            y=[sdk_origin[1], sdk_origin[1] + sdk_x[1]],
+            z=[sdk_origin[2], sdk_origin[2] + sdk_x[2]],
+            mode='lines+markers',
+            line=dict(color='red', width=6, dash='dash'),
+            marker=dict(size=4, color='red'),
+            name='SDK X-axis',
+            showlegend=True
+        ))
+        
+        fig.add_trace(go.Scatter3d(
+            x=[sdk_origin[0], sdk_origin[0] + sdk_y[0]],
+            y=[sdk_origin[1], sdk_origin[1] + sdk_y[1]],
+            z=[sdk_origin[2], sdk_origin[2] + sdk_y[2]],
+            mode='lines+markers',
+            line=dict(color='green', width=6, dash='dash'),
+            marker=dict(size=4, color='green'),
+            name='SDK Y-axis',
+            showlegend=True
+        ))
+        
+        fig.add_trace(go.Scatter3d(
+            x=[sdk_origin[0], sdk_origin[0] + sdk_z[0]],
+            y=[sdk_origin[1], sdk_origin[1] + sdk_z[1]],
+            z=[sdk_origin[2], sdk_origin[2] + sdk_z[2]],
+            mode='lines+markers',
+            line=dict(color='blue', width=6, dash='dash'),
+            marker=dict(size=4, color='blue'),
+            name='SDK Z-axis',
+            showlegend=True
+        ))
+        
+        # SDK 위치 표시
+        fig.add_trace(go.Scatter3d(
+            x=[sdk_origin[0]],
+            y=[sdk_origin[1]],
+            z=[sdk_origin[2]],
+            mode='markers',
+            marker=dict(
+                size=10,
+                color='purple',
+                symbol='x',
+                line=dict(width=3, color='purple')
+            ),
+            name='SDK Position',
+            showlegend=True
+        ))
+
+    # 4. 쿼리 포인트 표시
     fig.add_trace(go.Scatter3d(
         x=[query_point[0]],
         y=[query_point[1]],
@@ -1542,7 +1828,7 @@ def create_robot_3d_visualization_plotly(scene_mesh, robot_meshes, query_point, 
     print(f"Robot 3D visualization saved to: {save_path}")
 
 
-def create_multi_robot_viewpoint_set_3d_visualization(scene_mesh, robot_meshes_list, query_point, viewpoint_matrix, visibility_results, final_rewards, save_path):
+def create_multi_robot_viewpoint_set_3d_visualization(scene_mesh, robot_meshes_list, query_point, viewpoint_matrix, visibility_results, final_rewards, save_path, robot_viz=None, robot_joint_angles_list=None):
     """
     M개의 robot viewpoint set을 모두 보여주는 3D 시각화
     """
@@ -1624,6 +1910,112 @@ def create_multi_robot_viewpoint_set_3d_visualization(scene_mesh, robot_meshes_l
                 name=f'LoS{viewpoint_idx+1}',
                 showlegend=False
             ), row=1, col=set_idx+1)
+    
+    # Forward kinematics 결과의 좌표계 표시 (각 서브플롯에)
+    if robot_viz is not None and robot_joint_angles_list is not None:
+        for set_idx in range(M):
+            # 각 서브플롯에 해당하는 조인트 각도 사용
+            joint_angles = robot_joint_angles_list[set_idx] if set_idx < len(robot_joint_angles_list) else np.zeros(6)
+            coordinate_frames = robot_viz.get_coordinate_frames(frame_size=0.02, joint_angles=joint_angles)
+            for link_name, frame_data in coordinate_frames.items():
+                origin = frame_data['origin']
+                x_axis = frame_data['x_axis']
+                y_axis = frame_data['y_axis']
+                z_axis = frame_data['z_axis']
+                
+                # X축 (빨간색)
+                fig.add_trace(go.Scatter3d(
+                    x=[origin[0], origin[0] + x_axis[0]],
+                    y=[origin[1], origin[1] + x_axis[1]],
+                    z=[origin[2], origin[2] + x_axis[2]],
+                    mode='lines+markers',
+                    line=dict(color='red', width=3),
+                    marker=dict(size=2, color='red'),
+                    name=f'{link_name} X-axis',
+                    showlegend=False
+                ), row=1, col=set_idx+1)
+                
+                # Y축 (초록색)
+                fig.add_trace(go.Scatter3d(
+                    x=[origin[0], origin[0] + y_axis[0]],
+                    y=[origin[1], origin[1] + y_axis[1]],
+                    z=[origin[2], origin[2] + y_axis[2]],
+                    mode='lines+markers',
+                    line=dict(color='green', width=3),
+                    marker=dict(size=2, color='green'),
+                    name=f'{link_name} Y-axis',
+                    showlegend=False
+                ), row=1, col=set_idx+1)
+                
+                # Z축 (파란색)
+                fig.add_trace(go.Scatter3d(
+                    x=[origin[0], origin[0] + z_axis[0]],
+                    y=[origin[1], origin[1] + z_axis[1]],
+                    z=[origin[2], origin[2] + z_axis[2]],
+                    mode='lines+markers',
+                    line=dict(color='blue', width=3),
+                    marker=dict(size=2, color='blue'),
+                    name=f'{link_name} Z-axis',
+                    showlegend=False
+                ), row=1, col=set_idx+1)
+        
+            # End effector pose 강조 표시 (각 서브플롯에)
+            end_effector_pose = robot_viz.get_end_effector_pose(joint_angles=joint_angles)
+            if end_effector_pose is not None:
+                ee_origin = end_effector_pose[:3, 3]
+                ee_x = end_effector_pose[:3, 0] * 0.03
+                ee_y = end_effector_pose[:3, 1] * 0.03
+                ee_z = end_effector_pose[:3, 2] * 0.03
+            
+                # End effector 좌표계 (더 굵게)
+                fig.add_trace(go.Scatter3d(
+                    x=[ee_origin[0], ee_origin[0] + ee_x[0]],
+                    y=[ee_origin[1], ee_origin[1] + ee_x[1]],
+                    z=[ee_origin[2], ee_origin[2] + ee_x[2]],
+                    mode='lines+markers',
+                    line=dict(color='red', width=6),
+                    marker=dict(size=4, color='red'),
+                    name='End Effector X-axis',
+                    showlegend=False
+                ), row=1, col=set_idx+1)
+                
+                fig.add_trace(go.Scatter3d(
+                    x=[ee_origin[0], ee_origin[0] + ee_y[0]],
+                    y=[ee_origin[1], ee_origin[1] + ee_y[1]],
+                    z=[ee_origin[2], ee_origin[2] + ee_y[2]],
+                    mode='lines+markers',
+                    line=dict(color='green', width=6),
+                    marker=dict(size=4, color='green'),
+                    name='End Effector Y-axis',
+                    showlegend=False
+                ), row=1, col=set_idx+1)
+                
+                fig.add_trace(go.Scatter3d(
+                    x=[ee_origin[0], ee_origin[0] + ee_z[0]],
+                    y=[ee_origin[1], ee_origin[1] + ee_z[1]],
+                    z=[ee_origin[2], ee_origin[2] + ee_z[2]],
+                    mode='lines+markers',
+                    line=dict(color='blue', width=6),
+                    marker=dict(size=4, color='blue'),
+                    name='End Effector Z-axis',
+                    showlegend=False
+                ), row=1, col=set_idx+1)
+                
+                # End effector 위치 표시
+                fig.add_trace(go.Scatter3d(
+                    x=[ee_origin[0]],
+                    y=[ee_origin[1]],
+                    z=[ee_origin[2]],
+                    mode='markers',
+                    marker=dict(
+                        size=6,
+                        color='yellow',
+                        symbol='diamond',
+                        line=dict(width=2, color='orange')
+                    ),
+                    name='End Effector Position',
+                    showlegend=False
+                ), row=1, col=set_idx+1)
     
     # 레이아웃 설정
     fig.update_layout(
@@ -2077,6 +2469,7 @@ def main():
     # L개의 로봇 설정 및 메시 생성 (각 column index i에 대응하는 end effector pose로)
     robot_meshes_list = []
     robot_joint_angles_list = []
+    sdk_transform_for_viz = None  # SDK 결과 저장용
     
     for i, end_effector_pose in enumerate(end_effector_poses):
         print(f"\n  Setting up robot {i+1} with end effector pose: translation={end_effector_pose[:3, 3]}")
@@ -2088,6 +2481,13 @@ def main():
         ik_success = robot_viz.solve_inverse_kinematics(end_effector_pose, gripper_angle=0.0)
         
         if ik_success:
+            # Forward Kinematics 비교 (첫 번째 로봇에 대해서만)
+            if i == 0:
+                print(f"\n  === Forward Kinematics 비교 (Robot {i+1}) ===")
+                sdk_result, urdf_result = robot_viz.compare_forward_kinematics(gripper_angle=0.0)
+                if sdk_result is not None:
+                    sdk_transform_for_viz = sdk_result
+            
             # 로봇의 모든 링크 메시를 월드 좌표계로 변환하여 가져오기
             robot_meshes = robot_viz.get_robot_meshes_in_world(gripper_angle=0.0)
             robot_meshes_list.append(robot_meshes)
@@ -2348,7 +2748,8 @@ def main():
         create_robot_3d_visualization_plotly(
             mesh_original, current_robot_meshes, Xw_q, CANDIDATE_VIEWPOINTS_MATRIX[:, robot_idx], 
             current_robot_results, current_joint_angles,
-            f"visibility_test_output/3d_visualization_robot_{robot_idx + 1}.html"
+            f"visibility_test_output/3d_visualization_robot_{robot_idx + 1}.html",
+            robot_viz, sdk_transform_for_viz if robot_idx == 0 else None
         )
     
     # 원본 mesh와 비교를 위한 시각화 생성
@@ -2368,13 +2769,13 @@ def main():
     
     create_robot_3d_visualization_plotly(
         mesh_original, {}, Xw_q, CANDIDATE_VIEWPOINTS, original_results, np.zeros(6),
-        "visibility_test_output/3d_visualization_original.html"
+        "visibility_test_output/3d_visualization_original.html", robot_viz, sdk_transform_for_viz
     )
     
     # M개의 viewpoint set을 모두 보여주는 3D 시각화 생성
     create_multi_robot_viewpoint_set_3d_visualization(mesh_original, robot_meshes_list, Xw_q, CANDIDATE_VIEWPOINTS_MATRIX, 
                                                      visibility_results, final_rewards,
-                                                     "visibility_test_output/3d_multi_robot_viewpoint_sets.html")
+                                                     "visibility_test_output/3d_multi_robot_viewpoint_sets.html", robot_viz, robot_joint_angles_list)
     
     # RGB/Depth 렌더링 생성
     print("\nCreating robot RGB/Depth renderings...")
