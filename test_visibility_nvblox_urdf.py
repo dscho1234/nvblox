@@ -448,58 +448,9 @@ class Z1RobotVisualizer:
         
         return result
     
-    def compare_forward_kinematics(self, gripper_angle=0.0):
-        """Unitree SDK forwardKinematics와 URDF 기반 계산 결과를 비교"""
-        if self.arm_interface is None:
-            print("Unitree Z1 SDK가 초기화되지 않았습니다.")
-            return None
+    # compare_forward_kinematics: 디버그 용 함수 제거됨
         
-        # URDF 기반 전진기구학 계산
-        self.compute_forward_kinematics(gripper_angle)
-        
-        # Unitree SDK forwardKinematics 호출
-        try:
-            sdk_fk_result = self.arm_interface._ctrlComp.armModel.forwardKinematics(self.joint_angles, 6)
-            print(f"\n=== Forward Kinematics 비교 ===")
-            print(f"조인트 각도: {self.joint_angles}")
-            print(f"SDK forwardKinematics 결과 (link 6):")
-            print(f"  Translation: {sdk_fk_result[:3, 3]}")
-            print(f"  Rotation Matrix:")
-            print(f"    {sdk_fk_result[0, :3]}")
-            print(f"    {sdk_fk_result[1, :3]}")
-            print(f"    {sdk_fk_result[2, :3]}")
-            
-            # SDK 결과는 이미 4x4 변환 행렬
-            sdk_transform = sdk_fk_result
-            
-            print(f"\nURDF 기반 계산 결과:")
-            for link_name, transform in self.link_transforms.items():
-                if link_name == 'world':
-                    continue
-                print(f"  {link_name}:")
-                print(f"    Translation: {transform[:3, 3]}")
-                print(f"    Rotation Matrix:")
-                print(f"      {transform[0, :3]}")
-                print(f"      {transform[1, :3]}")
-                print(f"      {transform[2, :3]}")
-                
-                # SDK 결과와의 거리 계산
-                translation_diff = np.linalg.norm(transform[:3, 3] - sdk_transform[:3, 3])
-                rotation_diff = np.linalg.norm(transform[:3, :3] - sdk_transform[:3, :3])
-                
-                print(f"    SDK와의 차이:")
-                print(f"      Translation 차이: {translation_diff:.6f}m")
-                print(f"      Rotation 차이: {rotation_diff:.6f}")
-                
-                # 가장 가까운 링크 찾기
-                if translation_diff < 0.001:  # 1mm 이내
-                    print(f"    *** {link_name}이 SDK 결과와 가장 가깝습니다! ***")
-            
-            return sdk_transform, self.link_transforms
-            
-        except Exception as e:
-            print(f"SDK forwardKinematics 호출 오류: {e}")
-            return None, self.link_transforms
+    
 
 
 # ========= 사용자 설정 =========
@@ -1196,7 +1147,7 @@ def batch_raycasting_with_scene(scene, origins, directions, max_distances):
 
 
 
-def create_robot_3d_visualization_plotly(scene_mesh, robot_meshes, query_points, candidate_viewpoints, candidate_directions, results, joint_angles, save_path, robot_viz=None, sdk_transform=None, image_size=None, K_adjusted=None):
+def create_robot_3d_visualization_plotly(scene_mesh, robot_meshes, query_points, candidate_viewpoints, candidate_directions, results, joint_angles, save_path, robot_viz=None, image_size=None, K_adjusted=None):
     """
     Plotly를 사용한 로봇과 scene을 포함한 인터랙티브 3D 시각화 생성
     """
@@ -1405,62 +1356,7 @@ def create_robot_3d_visualization_plotly(scene_mesh, robot_meshes, query_points,
                 showlegend=True
             ))
     
-    # SDK forwardKinematics 결과 표시 (비교용)
-    if sdk_transform is not None:
-        sdk_origin = sdk_transform[:3, 3]
-        sdk_x = sdk_transform[:3, 0] * 0.05
-        sdk_y = sdk_transform[:3, 1] * 0.05
-        sdk_z = sdk_transform[:3, 2] * 0.05
-        
-        # SDK 좌표계 (점선으로 표시)
-        fig.add_trace(go.Scatter3d(
-            x=[sdk_origin[0], sdk_origin[0] + sdk_x[0]],
-            y=[sdk_origin[1], sdk_origin[1] + sdk_x[1]],
-            z=[sdk_origin[2], sdk_origin[2] + sdk_x[2]],
-            mode='lines+markers',
-            line=dict(color='red', width=6, dash='dash'),
-            marker=dict(size=4, color='red'),
-            name='SDK X-axis',
-            showlegend=True
-        ))
-        
-        fig.add_trace(go.Scatter3d(
-            x=[sdk_origin[0], sdk_origin[0] + sdk_y[0]],
-            y=[sdk_origin[1], sdk_origin[1] + sdk_y[1]],
-            z=[sdk_origin[2], sdk_origin[2] + sdk_y[2]],
-            mode='lines+markers',
-            line=dict(color='green', width=6, dash='dash'),
-            marker=dict(size=4, color='green'),
-            name='SDK Y-axis',
-            showlegend=True
-        ))
-        
-        fig.add_trace(go.Scatter3d(
-            x=[sdk_origin[0], sdk_origin[0] + sdk_z[0]],
-            y=[sdk_origin[1], sdk_origin[1] + sdk_z[1]],
-            z=[sdk_origin[2], sdk_origin[2] + sdk_z[2]],
-            mode='lines+markers',
-            line=dict(color='blue', width=6, dash='dash'),
-            marker=dict(size=4, color='blue'),
-            name='SDK Z-axis',
-            showlegend=True
-        ))
-        
-        # SDK 위치 표시
-        fig.add_trace(go.Scatter3d(
-            x=[sdk_origin[0]],
-            y=[sdk_origin[1]],
-            z=[sdk_origin[2]],
-            mode='markers',
-            marker=dict(
-                size=10,
-                color='purple',
-                symbol='x',
-                line=dict(width=3, color='purple')
-            ),
-            name='SDK Position',
-            showlegend=True
-        ))
+    # SDK 시각화 제거됨
 
     # 4. 쿼리 포인트들 표시 (N개)
     colors = ['red', 'blue', 'green', 'yellow', 'magenta', 'orange', 'purple', 'brown']
@@ -1608,7 +1504,7 @@ def create_robot_3d_visualization_plotly(scene_mesh, robot_meshes, query_points,
     print(f"Robot 3D visualization saved to: {save_path}")
 
 
-def build_robot_3d_visualization_traces(scene_mesh, robot_meshes, query_points, candidate_viewpoints, candidate_directions, results, joint_angles, robot_viz=None, sdk_transform=None, image_size=None, K_adjusted=None):
+def build_robot_3d_visualization_traces(scene_mesh, robot_meshes, query_points, candidate_viewpoints, candidate_directions, results, joint_angles, robot_viz=None, image_size=None, K_adjusted=None):
     """
     create_robot_3d_visualization_plotly와 동일한 시각화 요소를 Trace 리스트로 생성하여 반환
     (애니메이션 frame 구성에 사용)
@@ -1673,7 +1569,9 @@ def build_robot_3d_visualization_traces(scene_mesh, robot_meshes, query_points, 
     # 2. Robot 링크 메시들 표시
     colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown', 'pink', 'cyan']
     color_idx = 0
-    for link_name, robot_mesh in robot_meshes.items():
+    # 정해진 순서로 추가하여 frame 간 trace 인덱스 정합 유지
+    for link_name in sorted(list(robot_meshes.keys())):
+        robot_mesh = robot_meshes[link_name]
         if robot_mesh is not None and len(robot_mesh.vertices) > 0:
             vertices = np.asarray(robot_mesh.vertices)
             triangles = np.asarray(robot_mesh.triangles)
@@ -1788,51 +1686,7 @@ def build_robot_3d_visualization_traces(scene_mesh, robot_meshes, query_points, 
                 showlegend=True
             ))
 
-    # SDK forwardKinematics 결과 표시 (비교용)
-    if sdk_transform is not None:
-        sdk_origin = sdk_transform[:3, 3]
-        sdk_x = sdk_transform[:3, 0] * 0.05
-        sdk_y = sdk_transform[:3, 1] * 0.05
-        sdk_z = sdk_transform[:3, 2] * 0.05
-        traces.append(go.Scatter3d(
-            x=[sdk_origin[0], sdk_origin[0] + sdk_x[0]],
-            y=[sdk_origin[1], sdk_origin[1] + sdk_x[1]],
-            z=[sdk_origin[2], sdk_origin[2] + sdk_x[2]],
-            mode='lines+markers',
-            line=dict(color='red', width=6, dash='dash'),
-            marker=dict(size=4, color='red'),
-            name='SDK X-axis',
-            showlegend=True
-        ))
-        traces.append(go.Scatter3d(
-            x=[sdk_origin[0], sdk_origin[0] + sdk_y[0]],
-            y=[sdk_origin[1], sdk_origin[1] + sdk_y[1]],
-            z=[sdk_origin[2], sdk_origin[2] + sdk_y[2]],
-            mode='lines+markers',
-            line=dict(color='green', width=6, dash='dash'),
-            marker=dict(size=4, color='green'),
-            name='SDK Y-axis',
-            showlegend=True
-        ))
-        traces.append(go.Scatter3d(
-            x=[sdk_origin[0], sdk_origin[0] + sdk_z[0]],
-            y=[sdk_origin[1], sdk_origin[1] + sdk_z[1]],
-            z=[sdk_origin[2], sdk_origin[2] + sdk_z[2]],
-            mode='lines+markers',
-            line=dict(color='blue', width=6, dash='dash'),
-            marker=dict(size=4, color='blue'),
-            name='SDK Z-axis',
-            showlegend=True
-        ))
-        traces.append(go.Scatter3d(
-            x=[sdk_origin[0]],
-            y=[sdk_origin[1]],
-            z=[sdk_origin[2]],
-            mode='markers',
-            marker=dict(size=10, color='purple', symbol='x', line=dict(width=3, color='purple')),
-            name='SDK Position',
-            showlegend=True
-        ))
+    # SDK 시각화 제거됨
 
     # 4. 쿼리 포인트들 표시 (N개)
     qp_colors = ['red', 'blue', 'green', 'yellow', 'magenta', 'orange', 'purple', 'brown']
@@ -1901,7 +1755,7 @@ def build_robot_3d_visualization_traces(scene_mesh, robot_meshes, query_points, 
     return traces
 
 
-def create_robot_3d_visualization_plotly_animate(scene_mesh, robot_meshes_list, query_points, viewpoint_matrix, viewdirection_matrix, visibility_results, robot_joint_angles_list, save_path, robot_viz=None, sdk_transform=None, image_size=None, K_adjusted=None):
+def create_robot_3d_visualization_plotly_animate(scene_mesh, robot_meshes_list, query_points, viewpoint_matrix, viewdirection_matrix, visibility_results, robot_joint_angles_list, save_path, robot_viz=None, image_size=None, K_adjusted=None):
     """
     각 로봇 시각화를 하나의 HTML 내에서 애니메이션으로 순차 재생하도록 생성
     """
@@ -1937,7 +1791,7 @@ def create_robot_3d_visualization_plotly_animate(scene_mesh, robot_meshes_list, 
 
         traces = build_robot_3d_visualization_traces(
             scene_mesh, current_robot_meshes, query_points, viewpoint_matrix[:, robot_idx], viewdirection_matrix[:, robot_idx],
-            current_robot_results, current_joint_angles, robot_viz, sdk_transform if robot_idx == 0 else None, image_size, K_adjusted
+            current_robot_results, current_joint_angles, robot_viz, image_size, K_adjusted
         )
 
         frames.append(go.Frame(
@@ -2714,7 +2568,7 @@ def main():
     # L개의 로봇 설정 및 메시 생성 (각 column index i에 대응하는 end effector pose로)
     robot_meshes_list = []
     robot_joint_angles_list = []
-    sdk_transform_for_viz = None  # SDK 결과 저장용
+    # SDK 비교/시각화는 사용하지 않음
     
     for i, end_effector_pose in enumerate(end_effector_poses):
         print(f"\n  Setting up robot {i+1} with end effector pose: translation={end_effector_pose[:3, 3]}")
@@ -2730,11 +2584,7 @@ def main():
         
         if ik_success:
             # Forward Kinematics 비교 (첫 번째 로봇에 대해서만)
-            if i == 0:
-                print(f"\n  === Forward Kinematics 비교 (Robot {i+1}) ===")
-                sdk_result, urdf_result = robot_viz.compare_forward_kinematics(gripper_angle=gripper_angle)
-                if sdk_result is not None:
-                    sdk_transform_for_viz = sdk_result
+            # 디버그 비교 호출 제거
             
             # 로봇의 모든 링크 메시를 월드 좌표계로 변환하여 가져오기
             robot_meshes = robot_viz.get_robot_meshes_in_world(gripper_angle=gripper_angle)
@@ -3068,7 +2918,7 @@ def main():
             mesh_original, current_robot_meshes, query_points_3d, CANDIDATE_VIEWPOINTS_MATRIX[:, robot_idx], CANDIDATE_ROTATIONS_MATRIX[:, robot_idx], 
             current_robot_results, current_joint_angles,
             f"visibility_test_output/3d_visualization_robot_{robot_idx + 1}.html",
-            robot_viz, sdk_transform_for_viz if robot_idx == 0 else None, image_size, K_adjusted
+            robot_viz, image_size, K_adjusted
         )
     
     # 모든 robot 시각화를 하나의 애니메이션 HTML로 저장
@@ -3077,33 +2927,10 @@ def main():
         CANDIDATE_VIEWPOINTS_MATRIX, CANDIDATE_ROTATIONS_MATRIX,
         visibility_results, robot_joint_angles_list,
         "visibility_test_output/3d_visualization_animate.html",
-        robot_viz, sdk_transform_for_viz, image_size, K_adjusted
+        robot_viz, image_size, K_adjusted
     )
     print("Animated 3D visualization saved to: visibility_test_output/3d_visualization_animate.html")
 
-    # 원본 mesh와 비교를 위한 시각화 생성
-    print("Creating original mesh visualization for comparison...")
-    original_results = []
-    for i, (viewpoint, viewdirection) in enumerate(zip(CANDIDATE_VIEWPOINTS, CANDIDATE_ROTATIONS)):
-        # 원본 mesh에서는 모든 viewpoint가 visible하다고 가정 (실제로는 원본 mesh로 테스트해야 함)
-        original_results.append({
-            'viewpoint': viewpoint,
-            'visible_robot': True,  # 원본에서는 가정
-            'visible_original': True,
-            'hit_distance_robot': 0.0,
-            'hit_distance_original': 0.0,
-            'distance_to_query': np.linalg.norm(Xw_q - viewpoint)
-        })
-    
-    create_robot_3d_visualization_plotly(
-        mesh_original, {}, query_points_3d, CANDIDATE_VIEWPOINTS, CANDIDATE_ROTATIONS, original_results, np.zeros(6),
-        "visibility_test_output/3d_visualization_original.html", robot_viz, sdk_transform_for_viz, image_size, K_adjusted
-    )
-    
-    # M개의 viewpoint set을 모두 보여주는 3D 시각화 생성
-    create_multi_robot_viewpoint_set_3d_visualization(mesh_original, robot_meshes_list, query_points_3d, CANDIDATE_VIEWPOINTS_MATRIX, CANDIDATE_ROTATIONS_MATRIX, 
-                                                     visibility_results, final_rewards,
-                                                     "visibility_test_output/3d_multi_robot_viewpoint_sets.html", robot_viz, robot_joint_angles_list, image_size, K_adjusted)
     
     # RGB/Depth 렌더링 생성
     print("\nCreating robot RGB/Depth renderings...")
