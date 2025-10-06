@@ -40,6 +40,19 @@ from nvblox_torch.mesh import ColorMesh
 from nvblox_torch.projective_integrator_types import ProjectiveIntegratorType
 
 
+# ========= Verbose logging control =========
+VERBOSE = False
+
+def set_verbose(enabled: bool) -> None:
+    """Enable/disable verbose logging for this module."""
+    global VERBOSE
+    VERBOSE = bool(enabled)
+
+def vprint(*args, **kwargs) -> None:
+    """Print only when VERBOSE is True."""
+    if VERBOSE:
+        print(*args, **kwargs)
+
 # ========= Z1 Robot Visualizer Class =========
 class Z1RobotVisualizer:
     def __init__(self, urdf_path, mesh_base_path):
@@ -60,9 +73,9 @@ class Z1RobotVisualizer:
         # Unitree Z1 SDK 초기화
         try:
             self.arm_interface = unitree_arm_interface.ArmInterface(hasGripper=True)
-            print("Unitree Z1 SDK 초기화 성공")
+            vprint("Unitree Z1 SDK 초기화 성공")
         except Exception as e:
-            print(f"Unitree Z1 SDK 초기화 실패: {e}")
+            vprint(f"Unitree Z1 SDK 초기화 실패: {e}")
             self.arm_interface = None
         
         # URDF 파싱
@@ -75,14 +88,14 @@ class Z1RobotVisualizer:
         """URDF 파일을 파싱하여 로봇 구조 정보 추출"""
         try:
             self.robot = URDF.from_xml_file(self.urdf_path)
-            print(f"URDF 파싱 완료: {len(self.robot.joints)} 개 조인트, {len(self.robot.links)} 개 링크")
+            vprint(f"URDF 파싱 완료: {len(self.robot.joints)} 개 조인트, {len(self.robot.links)} 개 링크")
             
             # 조인트 정보 출력
             for i, joint in enumerate(self.robot.joints):
-                print(f"Joint {i+1}: {joint.name}, Type: {joint.type}, Axis: {joint.axis}")
+                vprint(f"Joint {i+1}: {joint.name}, Type: {joint.type}, Axis: {joint.axis}")
                 
         except Exception as e:
-            print(f"URDF 파싱 오류: {e}")
+            vprint(f"URDF 파싱 오류: {e}")
             
     def load_meshes(self):
         """각 링크의 메시 파일을 로드"""
@@ -112,7 +125,7 @@ class Z1RobotVisualizer:
                                     mesh_obj = o3d.io.read_triangle_mesh(stl_path)
                                     if len(mesh_obj.vertices) > 0:
                                         self.meshes[link_name] = mesh_obj
-                                        print(f"STL 메시 로드 성공: {link_name} -> {stl_path} ({len(mesh_obj.vertices)} vertices)")
+                                        vprint(f"STL 메시 로드 성공: {link_name} -> {stl_path} ({len(mesh_obj.vertices)} vertices)")
                                         continue
                                 
                                 # DAE 파일 시도
@@ -126,13 +139,13 @@ class Z1RobotVisualizer:
                                     
                                     if len(mesh_obj.vertices) > 0:
                                         self.meshes[link_name] = mesh_obj
-                                        print(f"DAE 메시 로드 성공: {link_name} -> {mesh_path} ({len(mesh_obj.vertices)} vertices)")
+                                        vprint(f"DAE 메시 로드 성공: {link_name} -> {mesh_path} ({len(mesh_obj.vertices)} vertices)")
                                     else:
-                                        print(f"빈 메시: {link_name}")
+                                        vprint(f"빈 메시: {link_name}")
                                 else:
-                                    print(f"메시 형식 오류: {link_name}")
+                                    vprint(f"메시 형식 오류: {link_name}")
                             except Exception as e:
-                                print(f"메시 로드 실패: {link_name} - {e}")
+                                vprint(f"메시 로드 실패: {link_name} - {e}")
                                 # 메시 로드 실패 시 간단한 기하학적 모양 생성
                                 self.create_simple_geometry(link_name)
         
@@ -155,7 +168,7 @@ class Z1RobotVisualizer:
                     mesh_obj = o3d.io.read_triangle_mesh(stl_path)
                     if len(mesh_obj.vertices) > 0:
                         self.meshes[gripper_name] = mesh_obj
-                        print(f"Gripper STL 메시 로드 성공: {gripper_name} -> {stl_path} ({len(mesh_obj.vertices)} vertices)")
+                        vprint(f"Gripper STL 메시 로드 성공: {gripper_name} -> {stl_path} ({len(mesh_obj.vertices)} vertices)")
                         continue
                 
                 # DAE 파일 시도
@@ -168,11 +181,11 @@ class Z1RobotVisualizer:
                         
                         if len(mesh_obj.vertices) > 0:
                             self.meshes[gripper_name] = mesh_obj
-                            print(f"Gripper DAE 메시 로드 성공: {gripper_name} -> {dae_path} ({len(mesh_obj.vertices)} vertices)")
+                            vprint(f"Gripper DAE 메시 로드 성공: {gripper_name} -> {dae_path} ({len(mesh_obj.vertices)} vertices)")
                             continue
                             
             except Exception as e:
-                print(f"Gripper 메시 로드 실패: {gripper_name} - {e}")
+                vprint(f"Gripper 메시 로드 실패: {gripper_name} - {e}")
                                 
     def create_simple_geometry(self, link_name):
         """메시 로드 실패 시 간단한 기하학적 모양 생성"""
@@ -203,47 +216,47 @@ class Z1RobotVisualizer:
             mesh = o3d.geometry.TriangleMesh.create_sphere(radius=0.02)
             
         self.meshes[link_name] = mesh
-        print(f"간단한 기하학적 모양 생성: {link_name}")
+        vprint(f"간단한 기하학적 모양 생성: {link_name}")
                                 
     def set_joint_angles(self, angles):
         """조인트 각도 설정"""
         self.joint_angles = np.array(angles)
-        print(f"조인트 각도 설정: {self.joint_angles}")
+        vprint(f"조인트 각도 설정: {self.joint_angles}")
         
     def solve_inverse_kinematics(self, target_pose, gripper_angle=0.0):
         """Inverse Kinematics를 사용하여 목표 pose에서 조인트 각도 계산"""
         if self.arm_interface is None:
-            print("Unitree Z1 SDK가 초기화되지 않았습니다.")
+            vprint("Unitree Z1 SDK가 초기화되지 않았습니다.")
             return False
             
         try:
             # 현재 조인트 각도를 초기 추정값으로 사용
             current_q = self.joint_angles.copy()
-            print(f"초기 조인트 각도: {current_q}")
+            vprint(f"초기 조인트 각도: {current_q}")
             
             # Inverse Kinematics 계산
             success, q_forward = self.arm_interface._ctrlComp.armModel.inverseKinematics(
                 target_pose, current_q, True  # checkInWorkSpace=True
             )
             
-            print(f"계산 후 조인트 각도: {q_forward}")
+            vprint(f"계산 후 조인트 각도: {q_forward}")
             
             if success:
                 # 계산된 조인트 각도로 업데이트
                 self.joint_angles = q_forward
-                print(f"Inverse Kinematics 성공: {self.joint_angles}")
+                vprint(f"Inverse Kinematics 성공: {self.joint_angles}")
                 
                 # Forward Kinematics로 검증
                 fk_result = self.arm_interface._ctrlComp.armModel.forwardKinematics(q_forward, 6)
-                print(f"Forward Kinematics 검증 결과:\n{fk_result}")
+                vprint(f"Forward Kinematics 검증 결과:\n{fk_result}")
                 
                 return True
             else:
-                print("Inverse Kinematics 실패: 목표 pose가 작업 공간 밖에 있습니다.")
+                vprint("Inverse Kinematics 실패: 목표 pose가 작업 공간 밖에 있습니다.")
                 return False
                 
         except Exception as e:
-            print(f"Inverse Kinematics 오류: {e}")
+            vprint(f"Inverse Kinematics 오류: {e}")
             return False
         
     def compute_forward_kinematics(self, gripper_angle=0.0):
@@ -478,7 +491,7 @@ else:  # low_resolution
     VOXEL_SIZE = 0.02   # 20mm - 낮은 해상도, 매끄러운 mesh
     
 
-print(f"Using {MESH_QUALITY}: voxel_size={VOXEL_SIZE}m")
+vprint(f"Using {MESH_QUALITY}: voxel_size={VOXEL_SIZE}m")
 
 # Depth estimation 설정
 USE_MONODEPTH = True  # True: UniDepth 사용, False: raw depth 사용
@@ -528,15 +541,15 @@ L = len(CANDIDATE_VIEWPOINTS)  # L개의 viewpoints per set
 
 
 
-print(f"Creating {M} viewpoint sets, each with {L} viewpoints")
-print(f"Total viewpoints: {M} x {L} = {M*L}")
+vprint(f"Creating {M} viewpoint sets, each with {L} viewpoints")
+vprint(f"Total viewpoints: {M} x {L} = {M*L}")
 
 # [M, L] 모양의 candidate viewpoints 배열 생성
 # 현재는 예제로 기존 CANDIDATE_VIEWPOINTS를 M번 복사
 CANDIDATE_VIEWPOINTS_MATRIX = np.array([CANDIDATE_VIEWPOINTS for _ in range(M)])
 CANDIDATE_ROTATIONS_MATRIX = np.array([CANDIDATE_ROTATIONS for _ in range(M)])
-print(f"Candidate viewpoints matrix shape: {CANDIDATE_VIEWPOINTS_MATRIX.shape}")  # [M, L, 3]
-print(f"Candidate rotations matrix shape: {CANDIDATE_ROTATIONS_MATRIX.shape}")  # [M, 3]
+vprint(f"Candidate viewpoints matrix shape: {CANDIDATE_VIEWPOINTS_MATRIX.shape}")
+vprint(f"Candidate rotations matrix shape: {CANDIDATE_ROTATIONS_MATRIX.shape}")
 
 
 
@@ -929,7 +942,7 @@ def create_mesh_with_nvblox(depth_image, rgb_image, K, voxel_size=0.005, max_int
     Returns:
         mesh: nvblox ColorMesh 객체 또는 (mesh, mapper) 튜플
     """
-    print("Creating mesh with nvblox...")
+    vprint("Creating mesh with nvblox...")
     start = time.time()
     # 데이터를 torch tensor로 변환
     H, W = depth_image.shape
@@ -972,7 +985,7 @@ def create_mesh_with_nvblox(depth_image, rgb_image, K, voxel_size=0.005, max_int
     # 메시 가져오기
     color_mesh = mapper.get_color_mesh()
     
-    print(f"nvblox mesh created with {color_mesh.vertices().shape[0]} vertices and {color_mesh.triangles().shape[0]} triangles")
+    vprint(f"nvblox mesh created with {color_mesh.vertices().shape[0]} vertices and {color_mesh.triangles().shape[0]} triangles")
     print('color mesh update time: ', time.time() - start)
     
     
@@ -1050,7 +1063,7 @@ def create_combined_scene_with_robot(scene_mesh, robot_meshes):
     Returns:
         scene: o3d.t.geometry.RaycastingScene 객체
     """
-    print("    Creating combined scene with robot...")
+    vprint("    Creating combined scene with robot...")
     start_time = time.time()
     
     # 1. Scene mesh를 Open3D로 변환
@@ -1072,7 +1085,7 @@ def create_combined_scene_with_robot(scene_mesh, robot_meshes):
     for link_name, robot_mesh in robot_meshes.items():
         if robot_mesh is not None and len(robot_mesh.vertices) > 0:
             combined_mesh += robot_mesh
-            print(f"    Added robot link {link_name}: {len(robot_mesh.vertices)} vertices")
+            vprint(f"    Added robot link {link_name}: {len(robot_mesh.vertices)} vertices")
     
     # 4. 결합된 메시를 tensor로 변환
     mesh_tensor = o3d.t.geometry.TriangleMesh.from_legacy(combined_mesh)
@@ -1082,8 +1095,8 @@ def create_combined_scene_with_robot(scene_mesh, robot_meshes):
     scene.add_triangles(mesh_tensor)
     
     end_time = time.time()
-    print(f"    Combined scene creation time: {end_time - start_time:.4f}s")
-    print(f"    Total vertices in combined scene: {len(combined_mesh.vertices)}")
+    vprint(f"    Combined scene creation time: {end_time - start_time:.4f}s")
+    vprint(f"    Total vertices in combined scene: {len(combined_mesh.vertices)}")
     
     return scene
 
@@ -1114,13 +1127,13 @@ def batch_raycasting_with_scene(scene, origins, directions, max_distances):
     rays = np.hstack([origins, directions])
     rays_tensor = o3d.core.Tensor(rays, dtype=o3d.core.Dtype.Float32)
     step1_time = time.time() - step1_start
-    print(f"      Step 1 - Ray preparation: {step1_time:.4f}s")
+    vprint(f"      Step 1 - Ray preparation: {step1_time:.4f}s")
     
     # 2. Batch raycasting 수행
     step2_start = time.time()
     ans = scene.cast_rays(rays_tensor)
     step2_time = (time.time() - step2_start)
-    print(f"      Step 2 - Ray casting: {step2_time:.4f}s")
+    vprint(f"      Step 2 - Ray casting: {step2_time:.4f}s")
     
     # 3. 결과 분석
     step3_start = time.time()
@@ -1132,13 +1145,13 @@ def batch_raycasting_with_scene(scene, origins, directions, max_distances):
     # Hit distance 조정: visible한 경우 max_distance로 설정
     hit_distances_adjusted = np.where(visible, max_distances, hit_distances)
     step3_time = time.time() - step3_start
-    print(f"      Step 3 - Result processing: {step3_time:.4f}s")
+    vprint(f"      Step 3 - Result processing: {step3_time:.4f}s")
     
     total_time = time.time() - total_start_time
-    print(f"    Batch raycasting ({len(origins)} rays): {total_time:.4f}s total")
+    vprint(f"    Batch raycasting ({len(origins)} rays): {total_time:.4f}s total")
     
     # 각 단계별 시간 요약
-    print(f"      Time breakdown: rays={step1_time:.4f}s, casting={step2_time:.4f}s, processing={step3_time:.4f}s")
+    vprint(f"      Time breakdown: rays={step1_time:.4f}s, casting={step2_time:.4f}s, processing={step3_time:.4f}s")
     
     return visible, hit_distances_adjusted
 
@@ -1501,7 +1514,7 @@ def create_robot_3d_visualization_plotly(scene_mesh, robot_meshes, query_points,
     
     # HTML 파일로 저장
     pyo.plot(fig, filename=save_path, auto_open=False)
-    print(f"Robot 3D visualization saved to: {save_path}")
+    vprint(f"Robot 3D visualization saved to: {save_path}")
 
 
 def build_robot_3d_visualization_traces(scene_mesh, robot_meshes, query_points, candidate_viewpoints, candidate_directions, results, joint_angles, robot_viz=None, image_size=None, K_adjusted=None):
@@ -1870,7 +1883,7 @@ def create_robot_3d_visualization_plotly_animate(scene_mesh, robot_meshes_list, 
     }])
 
     pyo.plot(fig, filename=save_path, auto_open=False)
-    print(f"Robot animated 3D visualization saved to: {save_path}")
+    vprint(f"Robot animated 3D visualization saved to: {save_path}")
 
 
 def create_end_effector_poses_demo(candidate_viewpoints):
@@ -1933,32 +1946,32 @@ def create_end_effector_poses_demo(candidate_viewpoints):
 
 # ========= 메인 =========
 def main():
-    print("=== URDF-based Robot Visibility Test with nvblox ===")
-    print("Using URDF robot meshes with Inverse Kinematics for realistic robot positioning")
+    vprint("=== URDF-based Robot Visibility Test with nvblox ===")
+    vprint("Using URDF robot meshes with Inverse Kinematics for realistic robot positioning")
     
     # 전체 실행 시간 측정
     total_start_time = time.time()
     
     # 1) 입력 로드
-    print("\n=== 1. Loading RGB-D Data ===")
+    vprint("\n=== 1. Loading RGB-D Data ===")
     load_start_time = time.time()
     rgb, depth_raw = load_rgbd_from_zarr(BUFFER_PATH, EPISODE_IDX, FRAME_IDX, DEPTH_SCALE)
     H, W = depth_raw.shape
     load_end_time = time.time()
-    print(f"Loaded RGB: {rgb.shape}, Depth: {depth_raw.shape}")
-    print(f"Data loading time: {load_end_time - load_start_time:.4f} seconds")
+    vprint(f"Loaded RGB: {rgb.shape}, Depth: {depth_raw.shape}")
+    vprint(f"Data loading time: {load_end_time - load_start_time:.4f} seconds")
 
     # 1.5) 이미지 리사이즈 (옵션) - UniDepth 사용시에는 RGB만 리사이즈
     if RESIZE:
-        print(f"\n=== 1.5. Resizing RGB to {RESIZE_SIZE} ===")
+        vprint(f"\n=== 1.5. Resizing RGB to {RESIZE_SIZE} ===")
         resize_start_time = time.time()
         rgb_resized, _, scale_factor_x, scale_factor_y = resize_image_and_depth(rgb, depth_raw, RESIZE_SIZE)
         K_adjusted = adjust_camera_intrinsics(K, scale_factor_x, scale_factor_y)
         resize_end_time = time.time()
-        print(f"Resized RGB: {rgb_resized.shape}, Original depth: {depth_raw.shape}")
-        print(f"Scale factors: x={scale_factor_x:.4f}, y={scale_factor_y:.4f}")
-        print(f"Adjusted camera intrinsics: fx={K_adjusted[0,0]:.2f}, fy={K_adjusted[1,1]:.2f}, cx={K_adjusted[0,2]:.2f}, cy={K_adjusted[1,2]:.2f}")
-        print(f"RGB resize time: {resize_end_time - resize_start_time:.4f} seconds")
+        vprint(f"Resized RGB: {rgb_resized.shape}, Original depth: {depth_raw.shape}")
+        vprint(f"Scale factors: x={scale_factor_x:.4f}, y={scale_factor_y:.4f}")
+        vprint(f"Adjusted camera intrinsics: fx={K_adjusted[0,0]:.2f}, fy={K_adjusted[1,1]:.2f}, cx={K_adjusted[0,2]:.2f}, cy={K_adjusted[1,2]:.2f}")
+        vprint(f"RGB resize time: {resize_end_time - resize_start_time:.4f} seconds")
     else:
         K_adjusted = K
         rgb_resized = rgb
@@ -1967,15 +1980,15 @@ def main():
         raise ValueError("K (intrinsics)가 None 입니다. 코드 상단의 K를 사용자의 카메라 파라미터로 채워주세요.")
 
     # 2) Depth 처리
-    print("\n=== 2. Depth Processing ===")
+    vprint("\n=== 2. Depth Processing ===")
     depth_start_time = time.time()
     
     if USE_MONODEPTH:
-        print("Using UniDepth for depth estimation...")
+        vprint("Using UniDepth for depth estimation...")
         
         # UniDepth 모델 로드
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Using device: {device}")
+        vprint(f"Using device: {device}")
         
         name = f"unidepth-v2-vit{MODEL_TYPE}14"
         model = UniDepthV2.from_pretrained(f"lpiccinelli/{name}")
@@ -1989,7 +2002,7 @@ def main():
             camera = camera.K.squeeze(0)
         
         # Depth 추정 (원본 크기 RGB 사용)
-        print(f"Running UniDepth on original RGB: {rgb.shape}")
+        vprint(f"Running UniDepth on original RGB: {rgb.shape}")
         depth_pred_original = get_depth_with_unidepth(rgb, K, model, camera)
         
         # Raw depth로 스케일링 (원본 크기)
@@ -1997,15 +2010,15 @@ def main():
         
         # 리사이즈가 필요한 경우 depth만 리사이즈
         if RESIZE:
-            print(f"Resizing depth from {depth_m_original.shape} to {RESIZE_SIZE}")
+            vprint(f"Resizing depth from {depth_m_original.shape} to {RESIZE_SIZE}")
             import cv2
             depth_m = cv2.resize(depth_m_original, RESIZE_SIZE, interpolation=cv2.INTER_LINEAR)
         else:
             depth_m = depth_m_original
         
-        print(f"Final depth shape: {depth_m.shape}")
+        vprint(f"Final depth shape: {depth_m.shape}")
     else:
-        print("Using raw depth data...")
+        vprint("Using raw depth data...")
         if RESIZE:
             import cv2
             depth_m = cv2.resize(depth_raw, RESIZE_SIZE, interpolation=cv2.INTER_LINEAR)
@@ -2013,19 +2026,19 @@ def main():
             depth_m = depth_raw
     
     depth_end_time = time.time()
-    print(f"Depth processing time: {depth_end_time - depth_start_time:.4f} seconds")
+    vprint(f"Depth processing time: {depth_end_time - depth_start_time:.4f} seconds")
 
     # 3) 월드 좌표계 = 원 카메라0 좌표계로 가정
     R0 = np.eye(3, dtype=np.float64)
     t0 = np.zeros(3, dtype=np.float64)
 
     # 4) 쿼리 픽셀 & 3D점
-    print(f"\n=== 3. Query Point Selection (N={N_QUERY_POINTS}) ===")
+    vprint(f"\n=== 3. Query Point Selection (N={N_QUERY_POINTS}) ===")
     query_start_time = time.time()
     
     # N개의 쿼리 픽셀 선택
     query_pixels = pick_query_pixels(depth_m, N=N_QUERY_POINTS)
-    print(f"Selected {len(query_pixels)} query pixels: {query_pixels}")
+    vprint(f"Selected {len(query_pixels)} query pixels: {query_pixels}")
     
     # 각 쿼리 픽셀을 3D 월드 좌표로 변환
     query_points_3d = []
@@ -2039,17 +2052,17 @@ def main():
         Xw_q = R0.T @ (Xc0_q - t0)
         query_points_3d.append(Xw_q)
         
-        print(f"[Query {i+1}] pixel=({uq},{vq}), depth={dq:.4f} m, world_pos={Xw_q}")
+        vprint(f"[Query {i+1}] pixel=({uq},{vq}), depth={dq:.4f} m, world_pos={Xw_q}")
     
     # 기존 호환성을 위해 첫 번째 쿼리 포인트를 메인 쿼리 포인트로 설정
     Xw_q = query_points_3d[0]  # 첫 번째 쿼리 포인트
     uq, vq = query_pixels[0]   # 첫 번째 픽셀 좌표
 
     query_end_time = time.time()
-    print(f"Query point selection time: {query_end_time - query_start_time:.4f} seconds")
+    vprint(f"Query point selection time: {query_end_time - query_start_time:.4f} seconds")
 
     # 5) URDF 기반 로봇 설정 및 nvblox 메시 생성
-    print("\n=== 4. URDF-based Robot Setup and nvblox Mesh Generation ===")
+    vprint("\n=== 4. URDF-based Robot Setup and nvblox Mesh Generation ===")
     mesh_start_time = time.time()
     
     # URDF 파일 경로 설정
@@ -2061,17 +2074,17 @@ def main():
     
     # L개의 end effector pose 생성 (각 column index i에 대응)
     end_effector_poses = create_end_effector_poses_demo(CANDIDATE_VIEWPOINTS)
-    print(f"Generated {len(end_effector_poses)} end effector poses")
+    vprint(f"Generated {len(end_effector_poses)} end effector poses")
     for i, pose in enumerate(end_effector_poses):
-        print(f"  Pose {i+1}: translation={pose[:3, 3]}")
+        vprint(f"  Pose {i+1}: translation={pose[:3, 3]}")
     
     # 원본 nvblox 메시 생성 (로봇 없이)
-    print("\nCreating original nvblox mesh (without robot)...")
+    vprint("\nCreating original nvblox mesh (without robot)...")
     original_mesh_start_time = time.time()
     mesh_original, mapper_original = create_mesh_with_nvblox(depth_m, rgb_resized, K_adjusted, voxel_size=VOXEL_SIZE, max_integration_distance=5.0, return_mapper=True)
     original_mesh_end_time = time.time()
-    print(f"Original nvblox mesh created in {original_mesh_end_time - original_mesh_start_time:.4f} seconds")
-    print(f"Original mesh has {mesh_original.vertices().shape[0]} vertices and {mesh_original.triangles().shape[0]} triangles")
+    vprint(f"Original nvblox mesh created in {original_mesh_end_time - original_mesh_start_time:.4f} seconds")
+    vprint(f"Original mesh has {mesh_original.vertices().shape[0]} vertices and {mesh_original.triangles().shape[0]} triangles")
     
     # L개의 로봇 설정 및 메시 생성 (각 column index i에 대응하는 end effector pose로)
     robot_meshes_list = []
@@ -2079,7 +2092,7 @@ def main():
     # SDK 비교/시각화는 사용하지 않음
     
     for i, end_effector_pose in enumerate(end_effector_poses):
-        print(f"\n  Setting up robot {i+1} with end effector pose: translation={end_effector_pose[:3, 3]}")
+        vprint(f"\n  Setting up robot {i+1} with end effector pose: translation={end_effector_pose[:3, 3]}")
         
         # 홈 포지션으로 초기화
         robot_viz.set_joint_angles([0, 0, 0, 0, 0, 0])
@@ -2099,44 +2112,44 @@ def main():
             robot_meshes_list.append(robot_meshes)
             robot_joint_angles_list.append(robot_viz.joint_angles.copy())
             
-            print(f"  Robot {i+1} setup successful: {len(robot_meshes)} links")
+            vprint(f"  Robot {i+1} setup successful: {len(robot_meshes)} links")
             for link_name, mesh in robot_meshes.items():
                 if mesh is not None and len(mesh.vertices) > 0:
-                    print(f"    {link_name}: {len(mesh.vertices)} vertices")
+                    vprint(f"    {link_name}: {len(mesh.vertices)} vertices")
         else:
-            print(f"  Robot {i+1} setup failed: Inverse Kinematics failed")
+            vprint(f"  Robot {i+1} setup failed: Inverse Kinematics failed")
             robot_meshes_list.append({})
             robot_joint_angles_list.append(np.zeros(6))
     
     mesh_end_time = time.time()
-    print(f"\nAll robot setups completed in {mesh_end_time - mesh_start_time:.4f} seconds")
+    vprint(f"\nAll robot setups completed in {mesh_end_time - mesh_start_time:.4f} seconds")
     
     # 6) M개의 viewpoint set에 대해 각 robot별로 visibility 체크
-    print("\n=== 5. URDF-based Robot Visibility Check ===")
+    vprint("\n=== 5. URDF-based Robot Visibility Check ===")
     visibility_start_time = time.time()
     
     # 카메라 파라미터를 한 번만 계산 (성능 최적화)
-    print("\nCalculating camera parameters...")
+    vprint("\nCalculating camera parameters...")
     if RESIZE:
         image_size = RESIZE_SIZE
     else:
         image_size = IMAGE_SIZE
     
     
-    print(f"Processing {M} viewpoint sets, each with {L} viewpoints...")
-    print(f"Total viewpoints to check: {M} x {L} = {M*L}")
+    vprint(f"Processing {M} viewpoint sets, each with {L} viewpoints...")
+    vprint(f"Total viewpoints to check: {M} x {L} = {M*L}")
     
     # [M, L, N] 모양의 visibility 결과 저장 (N개의 쿼리 포인트에 대해)
     visibility_results = np.zeros((M, L, N_QUERY_POINTS), dtype=bool)  # True if visible, False if occluded
     hit_distances = np.zeros((M, L, N_QUERY_POINTS), dtype=np.float64)  # Hit distances for each viewpoint and query point
     
     # 각 robot별로 RaycastingScene을 미리 생성 (성능 최적화)
-    print(f"\n=== Pre-creating RaycastingScenes for {L} robots ===")
+    vprint(f"\n=== Pre-creating RaycastingScenes for {L} robots ===")
     scene_creation_start_time = time.time()
     raycasting_scenes = []
     
     for robot_idx in range(L):
-        print(f"  Creating scene for robot {robot_idx + 1}...")
+        vprint(f"  Creating scene for robot {robot_idx + 1}...")
         if robot_idx < len(robot_meshes_list) and len(robot_meshes_list[robot_idx]) > 0:
             # Scene mesh와 robot meshes를 결합한 scene 생성
             scene = create_combined_scene_with_robot(mesh_original, robot_meshes_list[robot_idx])
@@ -2146,27 +2159,27 @@ def main():
         raycasting_scenes.append(scene)
     
     scene_creation_end_time = time.time()
-    print(f"All RaycastingScenes created in {scene_creation_end_time - scene_creation_start_time:.4f} seconds")
+    vprint(f"All RaycastingScenes created in {scene_creation_end_time - scene_creation_start_time:.4f} seconds")
     
     # 각 robot별로 (L개의 robot) visibility 체크
     for robot_idx in range(L):  # robot_idx는 column index i에 해당
-        print(f"\n=== Checking robot {robot_idx + 1} (column {robot_idx}) ===")
+        vprint(f"\n=== Checking robot {robot_idx + 1} (column {robot_idx}) ===")
         current_scene = raycasting_scenes[robot_idx]
         
         # 현재 robot_idx에 해당하는 column의 viewpoints들을 모음: CANDIDATE_VIEWPOINTS_MATRIX[:, robot_idx]
         viewpoints_for_this_robot = CANDIDATE_VIEWPOINTS_MATRIX[:, robot_idx]  # [M, 3] 모양
         viewdirections_for_this_robot = CANDIDATE_ROTATIONS_MATRIX[:, robot_idx]  # [M, 3] 모양
-        print(f"  Viewpoints for this robot: {viewpoints_for_this_robot.shape} (M viewpoints)")
+        vprint(f"  Viewpoints for this robot: {viewpoints_for_this_robot.shape} (M viewpoints)")
         
         # Batch raycasting 방식 (미리 생성된 scene 사용)
-        print(f"  Performing batch raycasting for {M} viewpoints...")
+        vprint(f"  Performing batch raycasting for {M} viewpoints...")
         
         # 각 viewpoint에 대해 N개의 쿼리 포인트에 대한 LOS 체크와 카메라 frustum 체크 수행
         for set_idx in range(M):
             viewpoint = viewpoints_for_this_robot[set_idx]
             viewdirection = viewdirections_for_this_robot[set_idx]  # [roll, pitch, yaw] in degrees
             
-            print(f"    Set {set_idx + 1}: {viewpoint}")
+            vprint(f"    Set {set_idx + 1}: {viewpoint}")
             
             # N개의 쿼리 포인트에 대해 visibility 체크
             for query_idx in range(N_QUERY_POINTS):
@@ -2206,53 +2219,53 @@ def main():
                 frustum_status = "FRUSTUM_OK" if frustum_visible else "FRUSTUM_OUT"
                 final_status = "VISIBLE" if final_visible else "OCCLUDED"
                 
-                print(f"      Query {query_idx + 1}: {final_status} (LOS: {los_status}, Frustum: {frustum_status}, hit: {los_hit_distance:.3f}m)")
+                vprint(f"      Query {query_idx + 1}: {final_status} (LOS: {los_status}, Frustum: {frustum_status}, hit: {los_hit_distance:.3f}m)")
             
     
     visibility_end_time = time.time()
-    print(f"\nURDF-based robot visibility check time: {visibility_end_time - visibility_start_time:.4f} seconds")
+    vprint(f"\nURDF-based robot visibility check time: {visibility_end_time - visibility_start_time:.4f} seconds")
     
     # 7) Reward 계산 (visible=1, occluded=0)
-    print(f"\n=== 6. Reward Calculation (N={N_QUERY_POINTS} query points) ===")
+    vprint(f"\n=== 6. Reward Calculation (N={N_QUERY_POINTS} query points) ===")
     reward_start_time = time.time()
     
     # [M, L, N] 모양의 reward 매트릭스 생성 (visible=1, occluded=0)
     reward_matrix = visibility_results.astype(np.float64)
     
-    print("Reward matrix (M x L x N):")
-    print("  M = viewpoint set index (row)")
-    print("  L = viewpoint index (column)")
-    print("  N = query point index (depth)")
-    print("  Value: 1.0 = visible, 0.0 = occluded")
-    print()
+    vprint("Reward matrix (M x L x N):")
+    vprint("  M = viewpoint set index (row)")
+    vprint("  L = viewpoint index (column)")
+    vprint("  N = query point index (depth)")
+    vprint("  Value: 1.0 = visible, 0.0 = occluded")
+    vprint("")
     
     # 각 viewpoint set별로 reward 출력
     for set_idx in range(M):
-        print(f"Viewpoint set {set_idx + 1}:")
+        vprint(f"Viewpoint set {set_idx + 1}:")
         for robot_idx in range(L):
             query_rewards = reward_matrix[set_idx, robot_idx, :]
-            print(f"  Robot {robot_idx + 1}: {query_rewards} (sum: {np.sum(query_rewards):.1f})")
+            vprint(f"  Robot {robot_idx + 1}: {query_rewards} (sum: {np.sum(query_rewards):.1f})")
     
     # 각 viewpoint set별로 최종 reward 계산 (L개의 viewpoint x N개의 query point에 따른 reward 합계)
     final_rewards = np.sum(reward_matrix, axis=(1, 2))  # [M] 모양의 배열 (L x N 합계)
-    print(f"\nFinal rewards for each viewpoint set:")
+    vprint(f"\nFinal rewards for each viewpoint set:")
     for set_idx in range(M):
-        print(f"  Set {set_idx + 1}: {final_rewards[set_idx]:.1f} (sum of {L} viewpoints x {N_QUERY_POINTS} query points)")
+        vprint(f"  Set {set_idx + 1}: {final_rewards[set_idx]:.1f} (sum of {L} viewpoints x {N_QUERY_POINTS} query points)")
     
-    print(f"\nFinal rewards array: {final_rewards}")
-    print(f"Total reward sum: {np.sum(final_rewards):.1f}")
+    vprint(f"\nFinal rewards array: {final_rewards}")
+    vprint(f"Total reward sum: {np.sum(final_rewards):.1f}")
     
     # 각 쿼리 포인트별 통계
-    print(f"\nQuery point statistics:")
+    vprint(f"\nQuery point statistics:")
     for query_idx in range(N_QUERY_POINTS):
         query_visibility = visibility_results[:, :, query_idx]
         total_visible = np.sum(query_visibility)
         total_possible = M * L
         visibility_rate = total_visible / total_possible * 100
-        print(f"  Query {query_idx + 1}: {total_visible}/{total_possible} visible ({visibility_rate:.1f}%)")
+        vprint(f"  Query {query_idx + 1}: {total_visible}/{total_possible} visible ({visibility_rate:.1f}%)")
     
     reward_end_time = time.time()
-    print(f"Reward calculation time: {reward_end_time - reward_start_time:.4f} seconds")
+    vprint(f"Reward calculation time: {reward_end_time - reward_start_time:.4f} seconds")
     
     # 결과 정리 (기존 코드와 호환성을 위해)
     results = []
@@ -2277,9 +2290,9 @@ def main():
         results.append(result)
     
     # 결과 출력
-    print("\n=== Visibility Check Results ===")
+    vprint("\n=== Visibility Check Results ===")
     for i, result in enumerate(results):
-        print(f"\nViewpoint {i+1}: {result['viewpoint']}, rotation={result['viewdirection']}°")
+        vprint(f"\nViewpoint {i+1}: {result['viewpoint']}, rotation={result['viewdirection']}°")
         # result['visible_robot']이 배열인 경우 첫 번째 요소 사용
         visible_robot = result['visible_robot']
         visible_original = result['visible_original']
@@ -2290,17 +2303,17 @@ def main():
         if hasattr(visible_original, '__len__') and not isinstance(visible_original, (str, bool)):
             visible_original = visible_original[0]
         
-        print(f"  Robot-transformed mesh: {'✓ VISIBLE' if visible_robot else '✗ OCCLUDED'} (hit_distance: {result['hit_distance_robot']:.3f}m)")
-        print(f"  Original mesh: {'✓ VISIBLE' if visible_original else '✗ OCCLUDED'} (hit_distance: {result['hit_distance_original']:.3f}m)")
+        vprint(f"  Robot-transformed mesh: {'✓ VISIBLE' if visible_robot else '✗ OCCLUDED'} (hit_distance: {result['hit_distance_robot']:.3f}m)")
+        vprint(f"  Original mesh: {'✓ VISIBLE' if visible_original else '✗ OCCLUDED'} (hit_distance: {result['hit_distance_original']:.3f}m)")
         
         # 로봇 변환 효과 분석
         if visible_original != visible_robot:
-            print(f"  🔄 Robot transformation changed visibility: {'✓ VISIBLE' if visible_original else '✗ OCCLUDED'} → {'✓ VISIBLE' if visible_robot else '✗ OCCLUDED'}")
+            vprint(f"  🔄 Robot transformation changed visibility: {'✓ VISIBLE' if visible_original else '✗ OCCLUDED'} → {'✓ VISIBLE' if visible_robot else '✗ OCCLUDED'}")
         if abs(result['hit_distance_original'] - result['hit_distance_robot']) > 0.01:
-            print(f"  📏 Hit distance changed: {result['hit_distance_original']:.3f}m → {result['hit_distance_robot']:.3f}m")
+            vprint(f"  📏 Hit distance changed: {result['hit_distance_original']:.3f}m → {result['hit_distance_robot']:.3f}m")
 
     # 8) 시각화
-    print("\n=== 7. Creating Visualizations ===")
+    vprint("\n=== 7. Creating Visualizations ===")
     viz_start_time = time.time()
     
     import os
@@ -2352,7 +2365,7 @@ def main():
     plt.tight_layout()
     plt.savefig("visibility_test_output/rgb_depth_query_with_robot_info.png", dpi=150, bbox_inches='tight')
     plt.close()
-    print("2D visualization with robot info saved to: visibility_test_output/rgb_depth_query_with_robot_info.png")
+    vprint("2D visualization with robot info saved to: visibility_test_output/rgb_depth_query_with_robot_info.png")
     
     # Reward 매트릭스 시각화 (N개의 쿼리 포인트에 대해)
     fig, ax = plt.subplots(1, 2, figsize=(15, 6))
@@ -2388,14 +2401,14 @@ def main():
     plt.tight_layout()
     plt.savefig("visibility_test_output/reward_analysis.png", dpi=150, bbox_inches='tight')
     plt.close()
-    print("Reward analysis visualization saved to: visibility_test_output/reward_analysis.png")
+    vprint("Reward analysis visualization saved to: visibility_test_output/reward_analysis.png")
 
     # 3D 시각화 - 각 robot별로 독립적인 시각화 생성
-    print("Creating individual 3D visualizations for each robot...")
+    vprint("Creating individual 3D visualizations for each robot...")
     
     # 각 robot별로 시각화 생성
     for robot_idx in range(L):
-        print(f"Creating visualization for robot {robot_idx + 1}...")
+        vprint(f"Creating visualization for robot {robot_idx + 1}...")
         
         # 현재 robot과 관련 데이터
         current_robot_meshes = robot_meshes_list[robot_idx] if robot_idx < len(robot_meshes_list) else {}
@@ -2437,7 +2450,7 @@ def main():
         "visibility_test_output/3d_visualization_animate.html",
         robot_viz, image_size, K_adjusted
     )
-    print("Animated 3D visualization saved to: visibility_test_output/3d_visualization_animate.html")
+    vprint("Animated 3D visualization saved to: visibility_test_output/3d_visualization_animate.html")
 
     
     
