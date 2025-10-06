@@ -1886,6 +1886,361 @@ def create_robot_3d_visualization_plotly_animate(scene_mesh, robot_meshes_list, 
     vprint(f"Robot animated 3D visualization saved to: {save_path}")
 
 
+def build_robot_3d_visualization_traces_point_cloud(scene_mesh, robot_meshes, query_points, candidate_viewpoints, candidate_directions, results, joint_angles, robot_viz=None, image_size=None, K_adjusted=None):
+    """
+    Point cloud 버전의 Trace 리스트를 생성하여 반환.
+    - Scene은 포인트 클라우드(Scatter3d)로 표현하며 per-vertex RGB를 사용
+    - Robot 링크는 기존과 동일하게 Mesh3d(삼각형 메시)로 표현
+    """
+    traces = []
+
+    # Scene mesh -> point cloud
+    if hasattr(scene_mesh, 'vertices') and callable(scene_mesh.vertices):
+        scene_vertices = scene_mesh.vertices().cpu().numpy()
+        scene_vertex_colors = scene_mesh.vertex_colors().cpu().numpy() if hasattr(scene_mesh, 'vertex_colors') and callable(scene_mesh.vertex_colors) else None
+    else:
+        scene_vertices = np.asarray(scene_mesh.vertices)
+        scene_vertex_colors = np.asarray(scene_mesh.vertex_colors) if hasattr(scene_mesh, 'vertex_colors') and len(scene_mesh.vertex_colors) > 0 else None
+
+    if scene_vertices is not None and len(scene_vertices) > 0:
+        # Downsample for performance if needed
+        max_points_scene = 150000
+        if len(scene_vertices) > max_points_scene:
+            idx = np.random.choice(len(scene_vertices), max_points_scene, replace=False)
+            scene_vertices_pc = scene_vertices[idx]
+            if scene_vertex_colors is not None and len(scene_vertex_colors) == len(scene_vertices):
+                scene_vertex_colors_pc = scene_vertex_colors[idx]
+            else:
+                scene_vertex_colors_pc = None
+        else:
+            scene_vertices_pc = scene_vertices
+            scene_vertex_colors_pc = scene_vertex_colors
+
+        # Prepare marker colors
+        if scene_vertex_colors_pc is not None and len(scene_vertex_colors_pc) == len(scene_vertices_pc):
+            if scene_vertex_colors_pc.max() <= 1.0:
+                colors_rgb = scene_vertex_colors_pc
+            else:
+                colors_rgb = scene_vertex_colors_pc / 255.0
+            colors_list = [f"rgb({int(c[0]*255)},{int(c[1]*255)},{int(c[2]*255)})" for c in colors_rgb]
+            marker_kwargs = dict(size=2, color=colors_list, opacity=0.7)
+        else:
+            marker_kwargs = dict(size=2, color='lightblue', opacity=0.7)
+
+        traces.append(go.Scatter3d(
+            x=scene_vertices_pc[:, 0],
+            y=scene_vertices_pc[:, 1],
+            z=scene_vertices_pc[:, 2],
+            mode='markers',
+            marker=marker_kwargs,
+            name='Scene Point Cloud',
+            showlegend=True
+        ))
+
+    # Robot 링크 메시를 Mesh3d로 표시
+    colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown', 'pink', 'cyan']
+    color_idx = 0
+    for link_name in sorted(list(robot_meshes.keys())):
+        robot_mesh = robot_meshes[link_name]
+        if robot_mesh is not None and len(robot_mesh.vertices) > 0:
+            vertices = np.asarray(robot_mesh.vertices)
+            triangles = np.asarray(robot_mesh.triangles) if hasattr(robot_mesh, 'triangles') else None
+            if vertices is None or len(vertices) == 0 or triangles is None or len(triangles) == 0:
+                continue
+            traces.append(go.Mesh3d(
+                x=vertices[:, 0],
+                y=vertices[:, 1],
+                z=vertices[:, 2],
+                i=triangles[:, 0],
+                j=triangles[:, 1],
+                k=triangles[:, 2],
+                color=colors[color_idx % len(colors)],
+                opacity=0.8,
+                name=f'Robot {link_name}',
+                showlegend=True
+            ))
+            color_idx += 1
+
+    # Forward kinematics coordinate frames
+    if robot_viz is not None:
+        coordinate_frames = robot_viz.get_coordinate_frames(frame_size=0.03, joint_angles=joint_angles)
+        for link_name, frame_data in coordinate_frames.items():
+            origin = frame_data['origin']
+            x_axis = frame_data['x_axis']
+            y_axis = frame_data['y_axis']
+            z_axis = frame_data['z_axis']
+
+            traces.append(go.Scatter3d(
+                x=[origin[0], origin[0] + x_axis[0]],
+                y=[origin[1], origin[1] + x_axis[1]],
+                z=[origin[2], origin[2] + x_axis[2]],
+                mode='lines+markers',
+                line=dict(color='red', width=4),
+                marker=dict(size=3, color='red'),
+                name=f'{link_name} X-axis',
+                showlegend=False
+            ))
+            traces.append(go.Scatter3d(
+                x=[origin[0], origin[0] + y_axis[0]],
+                y=[origin[1], origin[1] + y_axis[1]],
+                z=[origin[2], origin[2] + y_axis[2]],
+                mode='lines+markers',
+                line=dict(color='green', width=4),
+                marker=dict(size=3, color='green'),
+                name=f'{link_name} Y-axis',
+                showlegend=False
+            ))
+            traces.append(go.Scatter3d(
+                x=[origin[0], origin[0] + z_axis[0]],
+                y=[origin[1], origin[1] + z_axis[1]],
+                z=[origin[2], origin[2] + z_axis[2]],
+                mode='lines+markers',
+                line=dict(color='blue', width=4),
+                marker=dict(size=3, color='blue'),
+                name=f'{link_name} Z-axis',
+                showlegend=False
+            ))
+            traces.append(go.Scatter3d(
+                x=[origin[0] + 0.01],
+                y=[origin[1] + 0.01],
+                z=[origin[2] + 0.01],
+                mode='text',
+                text=[link_name],
+                textfont=dict(size=10, color='black'),
+                name=f'{link_name} label',
+                showlegend=False
+            ))
+
+        end_effector_pose = robot_viz.get_end_effector_pose(joint_angles=joint_angles)
+        if end_effector_pose is not None:
+            ee_origin = end_effector_pose[:3, 3]
+            ee_x = end_effector_pose[:3, 0] * 0.05
+            ee_y = end_effector_pose[:3, 1] * 0.05
+            ee_z = end_effector_pose[:3, 2] * 0.05
+            traces.append(go.Scatter3d(
+                x=[ee_origin[0], ee_origin[0] + ee_x[0]],
+                y=[ee_origin[1], ee_origin[1] + ee_x[1]],
+                z=[ee_origin[2], ee_origin[2] + ee_x[2]],
+                mode='lines+markers',
+                line=dict(color='red', width=8),
+                marker=dict(size=5, color='red'),
+                name='End Effector X-axis',
+                showlegend=True
+            ))
+            traces.append(go.Scatter3d(
+                x=[ee_origin[0], ee_origin[0] + ee_y[0]],
+                y=[ee_origin[1], ee_origin[1] + ee_y[1]],
+                z=[ee_origin[2], ee_origin[2] + ee_y[2]],
+                mode='lines+markers',
+                line=dict(color='green', width=8),
+                marker=dict(size=5, color='green'),
+                name='End Effector Y-axis',
+                showlegend=True
+            ))
+            traces.append(go.Scatter3d(
+                x=[ee_origin[0], ee_origin[0] + ee_z[0]],
+                y=[ee_origin[1], ee_origin[1] + ee_z[1]],
+                z=[ee_origin[2], ee_origin[2] + ee_z[2]],
+                mode='lines+markers',
+                line=dict(color='blue', width=8),
+                marker=dict(size=5, color='blue'),
+                name='End Effector Z-axis',
+                showlegend=True
+            ))
+            traces.append(go.Scatter3d(
+                x=[ee_origin[0]],
+                y=[ee_origin[1]],
+                z=[ee_origin[2]],
+                mode='markers',
+                marker=dict(size=8, color='yellow', symbol='diamond', line=dict(width=2, color='orange')),
+                name='End Effector Position',
+                showlegend=True
+            ))
+
+    # Query points
+    qp_colors = ['red', 'blue', 'green', 'yellow', 'magenta', 'orange', 'purple', 'brown']
+    for i, query_point in enumerate(query_points):
+        color = qp_colors[i % len(qp_colors)]
+        traces.append(go.Scatter3d(
+            x=[query_point[0]], y=[query_point[1]], z=[query_point[2]],
+            mode='markers',
+            marker=dict(size=12, color=color, symbol='diamond', line=dict(width=2, color='darkred')),
+            name=f'Query Point {i+1}',
+            showlegend=True
+        ))
+
+    # Camera frustum and LoS (first set only to match original behavior)
+    for i, (viewpoint, viewdirection, result) in enumerate(zip(candidate_viewpoints, candidate_directions, results)):
+        if i > 0:
+            continue
+
+        max_distance = 1.0
+        frustum_vertices = create_camera_frustum_visualization(viewpoint, viewdirection, K_adjusted, image_size, max_distance)
+        camera_pos = frustum_vertices[0]
+        camera_color = 'blue'
+
+        traces.append(go.Scatter3d(
+            x=[camera_pos[0]], y=[camera_pos[1]], z=[camera_pos[2]],
+            mode='markers',
+            marker=dict(size=10, color=camera_color, symbol='diamond', line=dict(width=2, color='darkblue')),
+            name=f'Camera {i+1}',
+            showlegend=True
+        ))
+
+        frustum_edges = [[0, 1], [0, 2], [0, 3], [0, 4], [1, 2], [2, 3], [3, 4], [4, 1]]
+        for edge in frustum_edges:
+            start_idx, end_idx = edge
+            traces.append(go.Scatter3d(
+                x=[frustum_vertices[start_idx, 0], frustum_vertices[end_idx, 0]],
+                y=[frustum_vertices[start_idx, 1], frustum_vertices[end_idx, 1]],
+                z=[frustum_vertices[start_idx, 2], frustum_vertices[end_idx, 2]],
+                mode='lines',
+                line=dict(color=camera_color, width=3, dash='dot'),
+                name=f'Frustum {i+1}' if edge == frustum_edges[0] else None,
+                showlegend=True if edge == frustum_edges[0] else False
+            ))
+
+        for query_idx, query_point in enumerate(query_points):
+            if hasattr(result['visible_robot'], '__len__') and not isinstance(result['visible_robot'], (str, bool)):
+                if query_idx < len(result['visible_robot']):
+                    query_visible = result['visible_robot'][query_idx]
+                else:
+                    query_visible = False
+            else:
+                query_visible = result['visible_robot'] if query_idx == 0 else False
+
+            los_color = 'green' if query_visible else 'red'
+            los_style = 'solid' if query_visible else 'dash'
+            los_name = f'LoS {i+1} to Q{query_idx+1} ({query_visible and "VISIBLE" or "OCCLUDED"})'
+            traces.append(go.Scatter3d(
+                x=[camera_pos[0], query_point[0]], y=[camera_pos[1], query_point[1]], z=[camera_pos[2], query_point[2]],
+                mode='lines',
+                line=dict(color=los_color, width=4 if query_idx == 0 else 2, dash=los_style),
+                name=los_name,
+                showlegend=True
+            ))
+
+    return traces
+
+
+def create_robot_3d_visualization_plotly_animate_point_cloud(scene_mesh, robot_meshes_list, query_points, viewpoint_matrix, viewdirection_matrix, visibility_results, robot_joint_angles_list, save_path, robot_viz=None, image_size=None, K_adjusted=None):
+    """
+    create_robot_3d_visualization_plotly_animate와 동일하나,
+    Scene/Robot mesh를 포인트 클라우드로 표시하여 애니메이션 생성
+    """
+    M, L = viewpoint_matrix.shape[:2]
+
+    frames = []
+    for robot_idx in range(L):
+        current_robot_meshes = robot_meshes_list[robot_idx] if robot_idx < len(robot_meshes_list) else {}
+        current_joint_angles = robot_joint_angles_list[robot_idx] if robot_idx < len(robot_joint_angles_list) else np.zeros(6)
+
+        # 현재 로봇 결과 구성 (시각화에서 visible만 사용)
+        current_robot_results = []
+        for set_idx in range(M):
+            # dscho NOTE: currently, assume that data is same for all M.
+            if set_idx > 0:
+                continue
+
+            visible = visibility_results[set_idx, robot_idx]
+            viewpoint = viewpoint_matrix[set_idx, robot_idx]
+            viewdirection = viewdirection_matrix[set_idx, robot_idx]
+            if len(query_points) > 0:
+                distance_to_query = float(np.linalg.norm(np.asarray(query_points[0]) - viewpoint))
+            else:
+                distance_to_query = 0.0
+            current_robot_results.append({
+                'viewpoint': viewpoint,
+                'visible_robot': visible,
+                'visible_original': visible,
+                'hit_distance_robot': 0.0,
+                'hit_distance_original': 0.0,
+                'distance_to_query': distance_to_query
+            })
+
+        traces = build_robot_3d_visualization_traces_point_cloud(
+            scene_mesh, current_robot_meshes, query_points, viewpoint_matrix[:, robot_idx], viewdirection_matrix[:, robot_idx],
+            current_robot_results, current_joint_angles, robot_viz, image_size, K_adjusted
+        )
+
+        frames.append(go.Frame(
+            name=f"Robot {robot_idx + 1}",
+            data=traces,
+            layout=go.Layout(title=f'Robot Visibility Analysis (Point Cloud) - Robot {robot_idx + 1}')
+        ))
+
+    if len(frames) == 0:
+        return
+
+    fig = go.Figure(data=frames[0].data, frames=frames)
+
+    # 공통 레이아웃 설정
+    fig.update_layout(
+        title=dict(text='Robot Visibility Analysis (Animated, Point Cloud)', x=0.5, font=dict(size=18)),
+        scene=dict(
+            xaxis_title='X (m)',
+            yaxis_title='Y (m)',
+            zaxis_title='Z (m)',
+            aspectmode='data',
+            camera=dict(eye=dict(x=1.5, y=1.5, z=1.5)),
+            bgcolor='lightgray'
+        ),
+        width=1400,
+        height=900,
+        margin=dict(l=0, r=0, t=80, b=0),
+        legend=dict(x=0.02, y=0.98, bgcolor='rgba(255,255,255,0.8)', bordercolor='black', borderwidth=1),
+        updatemenus=[{
+            'type': 'buttons',
+            'showactive': False,
+            'buttons': [
+                {
+                    'label': 'Play',
+                    'method': 'animate',
+                    'args': [None, {
+                        'frame': {'duration': 800, 'redraw': True},
+                        'fromcurrent': True,
+                        'transition': {'duration': 300, 'easing': 'quadratic-in-out'}
+                    }]
+                },
+                {
+                    'label': 'Pause',
+                    'method': 'animate',
+                    'args': [[None], {
+                        'mode': 'immediate',
+                        'frame': {'duration': 0, 'redraw': False},
+                        'transition': {'duration': 0}
+                    }]
+                }
+            ],
+            'direction': 'left',
+            'pad': {'r': 10, 't': 70},
+            'x': 0.1,
+            'y': 0,
+            'xanchor': 'right',
+            'yanchor': 'top'
+        }]
+    )
+
+    # 슬라이더 추가
+    slider_steps = []
+    for k, fr in enumerate(fig.frames):
+        slider_steps.append({
+            'args': [[fr.name], {'frame': {'duration': 0, 'redraw': True}, 'mode': 'immediate'}],
+            'label': fr.name,
+            'method': 'animate'
+        })
+    fig.update_layout(sliders=[{
+        'active': 0,
+        'pad': {'t': 50, 'b': 10},
+        'steps': slider_steps,
+        'x': 0.1,
+        'y': -0.02,
+        'len': 0.9
+    }])
+
+    pyo.plot(fig, filename=save_path, auto_open=False)
+    vprint(f"Robot animated 3D point cloud visualization saved to: {save_path}")
+
 def create_end_effector_poses_demo(candidate_viewpoints):
     """
     End effector pose들을 생성 (각 viewpoint별로)
@@ -2451,6 +2806,16 @@ def main():
         robot_viz, image_size, K_adjusted
     )
     vprint("Animated 3D visualization saved to: visibility_test_output/3d_visualization_animate.html")
+
+    # 모든 robot 시각화를 포인트 클라우드 애니메이션 HTML로 저장
+    create_robot_3d_visualization_plotly_animate_point_cloud(
+        mesh_original, robot_meshes_list, query_points_3d,
+        CANDIDATE_VIEWPOINTS_MATRIX, CANDIDATE_ROTATIONS_MATRIX,
+        visibility_results, robot_joint_angles_list,
+        "visibility_test_output/3d_visualization_animate_point_cloud.html",
+        robot_viz, image_size, K_adjusted
+    )
+    vprint("Animated 3D point cloud visualization saved to: visibility_test_output/3d_visualization_animate_point_cloud.html")
 
     
     
