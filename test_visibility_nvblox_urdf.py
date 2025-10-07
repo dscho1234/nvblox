@@ -468,9 +468,9 @@ class Z1RobotVisualizer:
 
 # ========= 사용자 설정 =========
 # Zarr 데이터 경로 설정
-BUFFER_PATH = "/home/dscho1234/fast_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/slam_head_mounted_camera_multi_marker_initial_lag"
+BUFFER_PATH = "/home/dscho1234/fast_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/single_marker_bottle_under_table_wilor"
 EPISODE_IDX = 0
-FRAME_IDX = 100  # 특정 프레임 선택
+FRAME_IDX = 0  # 특정 프레임 선택
 DEPTH_SCALE = 0.001        # 깊이 단위 → 미터 변환 (예: mm면 0.001, 이미 m면 1.0)
 OFFSET_DISTANCE = 0.05 # for convex part of the constructed mesh
 
@@ -496,6 +496,10 @@ vprint(f"Using {MESH_QUALITY}: voxel_size={VOXEL_SIZE}m")
 # Depth estimation 설정
 USE_MONODEPTH = True  # True: UniDepth 사용, False: raw depth 사용
 MODEL_TYPE = "l"  # UniDepth model type: s, b, l
+
+
+USE_FAKE_DEPTH = True
+FAKE_DEPTH_VALUE = 0
 
 # 이미지 리사이즈 설정
 RESIZE = False # True  # True: 이미지를 256x256으로 리사이즈, False: 원본 크기 사용
@@ -710,6 +714,25 @@ def adjust_camera_intrinsics(K, scale_factor_x, scale_factor_y):
     return K_adjusted
 
 
+def apply_fake_depth_to_mask(depths, mask, fake_value):
+    """
+    Apply fake depth (0) to depth values where mask=1
+    
+    Args:
+        depths: numpy array of shape [t, h, w] with depth values
+        mask: numpy array of shape [t, h, w] with binary values (0 or 1)
+    
+    Returns:
+        Modified depths with 0 values in masked regions
+    """    
+    # Create a copy to avoid modifying original data
+    modified_depths = depths.copy()
+    
+    # Apply 0 depth to masked regions
+    modified_depths = np.where(mask == 1, fake_value, modified_depths)
+    
+    return modified_depths
+
 def load_rgbd_from_zarr(buffer_path, episode_idx, frame_idx, depth_scale=0.001):
     """Zarr에서 RGB와 depth 데이터를 불러오는 함수"""
     register_codecs()
@@ -723,19 +746,50 @@ def load_rgbd_from_zarr(buffer_path, episode_idx, frame_idx, depth_scale=0.001):
         group=episode["camera_0"],
         array_name="rgb",
     )
-    rgb = rgb_frames[frame_idx]  # 특정 프레임 선택
     
-    # Depth 프레임 로드
-    
+    # Depth 프레임 로드    
     depth_frames = parallel_reading(
         group=episode["camera_0"],
         array_name="depth",
     )
+    print(f"rgb_frames.shape: {rgb_frames.shape}")
+    print(f"depth_frames.shape: {depth_frames.shape}")
+
+    fake_depth_mask = None
+    if USE_FAKE_DEPTH:
+        # assert cfg.use_video, "When you use HaMeR related outputs, you should consider that some frames are cut, and the logging should start from the first hand-detected frames"
+        mask = episode["sam_mask_sequence_multi_obj"][:] # [t, num_obj(obj, hand), h, w]
+        
+        use_video = True
+        if not use_video: # when you load from raw png files
+            all_detected_frame_index = episode["all_detected_frame_index"][()] # get scalar
+            assert rgb_frames[all_detected_frame_index:].shape[0] == mask.shape[0], f"rgb_frames shape: {rgb_frames[all_detected_frame_index:].shape}, mask shape: {mask.shape}"
+        else: # when you load from parallel_reading
+            all_detected_frame_index = 0
+        
+        print(f"mask.shape: {mask.shape}, all_detected_frame_index: {all_detected_frame_index}")
+
+        assert rgb_frames[all_detected_frame_index:].shape[0] == mask.shape[0], f"rgb_frames shape: {rgb_frames[all_detected_frame_index:].shape}, mask shape: {mask.shape}"
+        
+        # Combine all objects into a single mask [t, h, w]
+        # Any pixel that is 1 in any object becomes 1 in the combined mask
+        combined_mask = np.any(mask == 1, axis=1)  # [t, h, w]
+        print(f"combined_mask.shape: {combined_mask.shape}")
+        
+        fake_depth_mask = combined_mask[frame_idx]
+
+            
+
+    rgb = rgb_frames[frame_idx]  # 특정 프레임 선택
     depth_raw = depth_frames[frame_idx]  # 특정 프레임 선택
     depth_m = depth_raw.astype(np.float32) * depth_scale
     
     
-    return rgb, depth_m
+
+    
+            
+    
+    return rgb, depth_m, fake_depth_mask
 
 
 def radial_depth_to_z_depth(radial_depth, intrinsics):
@@ -950,8 +1004,8 @@ def create_mesh_with_nvblox(depth_image, rgb_image, K, voxel_size=0.005, max_int
     # Depth 이미지를 torch tensor로 변환 (GPU)
     depth_tensor = torch.from_numpy(depth_image.astype(np.float32)).cuda()
     
-    # RGB 이미지를 torch tensor로 변환 (GPU, uint8)
-    rgb_tensor = torch.from_numpy((rgb_image * 255).astype(np.uint8)).cuda()
+    # RGB 이미지를 torch tensor로 변환 (GPU)
+    rgb_tensor = torch.from_numpy(rgb_image).cuda()
     
     # 카메라 내부 파라미터를 torch tensor로 변환 (CPU)
     intrinsics_tensor = torch.from_numpy(K.astype(np.float32)).cpu()
@@ -2322,7 +2376,7 @@ def main():
     # 1) 입력 로드
     vprint("\n=== 1. Loading RGB-D Data ===")
     load_start_time = time.time()
-    rgb, depth_raw = load_rgbd_from_zarr(BUFFER_PATH, EPISODE_IDX, FRAME_IDX, DEPTH_SCALE)
+    rgb, depth_raw, fake_depth_mask = load_rgbd_from_zarr(BUFFER_PATH, EPISODE_IDX, FRAME_IDX, DEPTH_SCALE)
     H, W = depth_raw.shape
     load_end_time = time.time()
     vprint(f"Loaded RGB: {rgb.shape}, Depth: {depth_raw.shape}")
@@ -2374,6 +2428,12 @@ def main():
         
         # Raw depth로 스케일링 (원본 크기)
         depth_m_original = scale_depth_with_raw(depth_pred_original, depth_raw, K)
+
+
+        if USE_FAKE_DEPTH:
+            print("Applying fake depth (0) to masked regions...")
+            depth_m_original = apply_fake_depth_to_mask(depth_m_original[None], fake_depth_mask[None], FAKE_DEPTH_VALUE)[0]
+            
         
         # 리사이즈가 필요한 경우 depth만 리사이즈
         if RESIZE:
@@ -2386,6 +2446,10 @@ def main():
         vprint(f"Final depth shape: {depth_m.shape}")
     else:
         vprint("Using raw depth data...")
+        if USE_FAKE_DEPTH:
+            print("Applying fake depth (0) to masked regions...")
+            depth_raw = apply_fake_depth_to_mask(depth_raw[None], fake_depth_mask[None], FAKE_DEPTH_VALUE)[0]
+
         if RESIZE:
             import cv2
             depth_m = cv2.resize(depth_raw, RESIZE_SIZE, interpolation=cv2.INTER_LINEAR)
