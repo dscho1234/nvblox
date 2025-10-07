@@ -388,20 +388,38 @@ class Z1RobotVisualizer:
         
         return transformed_mesh
         
-    def get_robot_meshes_in_world(self, gripper_angle=0.0):
-        """로봇의 모든 링크 메시를 월드 좌표계로 변환하여 반환"""
+    
+    def get_robot_meshes_in_specified_transform(self, gripper_angle=0.0, T_target=None):
+        """로봇의 모든 링크 메시를 지정된 좌표계로 변환하여 반환
+        
+        Args:
+            gripper_angle: 그리퍼 각도
+            T_target: 목표 좌표계 변환 행렬 (4x4). None이면 월드 좌표계 사용
+        
+        Returns:
+            transformed_meshes: 지정된 좌표계로 변환된 메시 딕셔너리
+        """
         # 전진기구학 계산
         self.compute_forward_kinematics(gripper_angle)
         
-        world_meshes = {}
+        transformed_meshes = {}
         for link_name, mesh in self.meshes.items():
             if link_name in self.link_transforms:
-                # 메시를 월드 좌표계로 변환
-                world_mesh = self.transform_mesh_to_world(mesh, self.link_transforms[link_name])
-                world_meshes[link_name] = world_mesh
+                if T_target is not None:
+                    # 월드 좌표계에서 목표 좌표계로 변환
+                    world_transform = self.link_transforms[link_name]
+                    target_transform = T_target @ world_transform
+                    
+                    # 메시를 목표 좌표계로 변환
+                    target_mesh = self.transform_mesh_to_world(mesh, target_transform)
+                    transformed_meshes[link_name] = target_mesh
+                else:
+                    # T_target이 None이면 월드 좌표계 사용
+                    world_mesh = self.transform_mesh_to_world(mesh, self.link_transforms[link_name])
+                    transformed_meshes[link_name] = world_mesh
         
-        return world_meshes
-    
+        return transformed_meshes
+
     def get_coordinate_frames(self, gripper_angle=0.0, frame_size=0.05, joint_angles=None):
         """Forward kinematics 결과에서 각 링크의 좌표계를 반환"""
         # 조인트 각도가 제공되면 임시로 설정
@@ -470,7 +488,7 @@ class Z1RobotVisualizer:
 # Zarr 데이터 경로 설정
 BUFFER_PATH = "/home/dscho1234/fast_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/single_marker_bottle_under_table_wilor"
 EPISODE_IDX = 0
-FRAME_IDX = 0  # 특정 프레임 선택
+FRAME_IDX = 50  # 특정 프레임 선택
 DEPTH_SCALE = 0.001        # 깊이 단위 → 미터 변환 (예: mm면 0.001, 이미 m면 1.0)
 OFFSET_DISTANCE = 0.05 # for convex part of the constructed mesh
 
@@ -502,7 +520,7 @@ USE_FAKE_DEPTH = True
 FAKE_DEPTH_VALUE = 0
 
 # 이미지 리사이즈 설정
-RESIZE = False # True  # True: 이미지를 256x256으로 리사이즈, False: 원본 크기 사용
+RESIZE = True  # True: 이미지를 256x256으로 리사이즈, False: 원본 크기 사용
 RESIZE_SIZE = (256, 256)  # 리사이즈할 크기 (width, height)
 IMAGE_SIZE = (640, 480)
 # (중요) 카메라 내파라미터: 사용자가 직접 채우세요.
@@ -2539,7 +2557,7 @@ def main():
             # 디버그 비교 호출 제거
             
             # 로봇의 모든 링크 메시를 월드 좌표계로 변환하여 가져오기
-            robot_meshes = robot_viz.get_robot_meshes_in_world(gripper_angle=gripper_angle)
+            robot_meshes = robot_viz.get_robot_meshes_in_specified_transform(gripper_angle=gripper_angle)
             robot_meshes_list.append(robot_meshes)
             robot_joint_angles_list.append(robot_viz.joint_angles.copy())
             
