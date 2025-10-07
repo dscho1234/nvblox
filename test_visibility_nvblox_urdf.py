@@ -498,7 +498,7 @@ USE_MONODEPTH = True  # True: UniDepth 사용, False: raw depth 사용
 MODEL_TYPE = "l"  # UniDepth model type: s, b, l
 
 # 이미지 리사이즈 설정
-RESIZE = True  # True: 이미지를 256x256으로 리사이즈, False: 원본 크기 사용
+RESIZE = False # True  # True: 이미지를 256x256으로 리사이즈, False: 원본 크기 사용
 RESIZE_SIZE = (256, 256)  # 리사이즈할 크기 (width, height)
 IMAGE_SIZE = (640, 480)
 # (중요) 카메라 내파라미터: 사용자가 직접 채우세요.
@@ -1886,7 +1886,7 @@ def create_robot_3d_visualization_plotly_animate(scene_mesh, robot_meshes_list, 
     vprint(f"Robot animated 3D visualization saved to: {save_path}")
 
 
-def build_robot_3d_visualization_traces_point_cloud(scene_mesh, robot_meshes, query_points, candidate_viewpoints, candidate_directions, results, joint_angles, robot_viz=None, image_size=None, K_adjusted=None):
+def build_robot_3d_visualization_traces_point_cloud(robot_meshes, query_points, candidate_viewpoints, candidate_directions, results, joint_angles, robot_viz=None, image_size=None, K_adjusted=None, rgb_image=None, depth_image=None):
     """
     Point cloud 버전의 Trace 리스트를 생성하여 반환.
     - Scene은 포인트 클라우드(Scatter3d)로 표현하며 per-vertex RGB를 사용
@@ -1894,48 +1894,60 @@ def build_robot_3d_visualization_traces_point_cloud(scene_mesh, robot_meshes, qu
     """
     traces = []
 
-    # Scene mesh -> point cloud
-    if hasattr(scene_mesh, 'vertices') and callable(scene_mesh.vertices):
-        scene_vertices = scene_mesh.vertices().cpu().numpy()
-        scene_vertex_colors = scene_mesh.vertex_colors().cpu().numpy() if hasattr(scene_mesh, 'vertex_colors') and callable(scene_mesh.vertex_colors) else None
-    else:
-        scene_vertices = np.asarray(scene_mesh.vertices)
-        scene_vertex_colors = np.asarray(scene_mesh.vertex_colors) if hasattr(scene_mesh, 'vertex_colors') and len(scene_mesh.vertex_colors) > 0 else None
+    # Scene point cloud from RGB-D and intrinsics
+    if rgb_image is not None and depth_image is not None and K_adjusted is not None:
+        H, W = depth_image.shape[:2]
+        fx, fy, cx, cy = float(K_adjusted[0, 0]), float(K_adjusted[1, 1]), float(K_adjusted[0, 2]), float(K_adjusted[1, 2])
 
-    if scene_vertices is not None and len(scene_vertices) > 0:
-        # Downsample for performance if needed
-        max_points_scene = 150000
-        if len(scene_vertices) > max_points_scene:
-            idx = np.random.choice(len(scene_vertices), max_points_scene, replace=False)
-            scene_vertices_pc = scene_vertices[idx]
-            if scene_vertex_colors is not None and len(scene_vertex_colors) == len(scene_vertices):
-                scene_vertex_colors_pc = scene_vertex_colors[idx]
+        us = np.arange(W)
+        vs = np.arange(H)
+        uu, vv = np.meshgrid(us, vs)
+        z = depth_image.astype(np.float64)
+        valid = np.isfinite(z) & (z > 0)
+
+        if np.any(valid):
+            uu_valid = uu[valid].astype(np.float64)
+            vv_valid = vv[valid].astype(np.float64)
+            z_valid = z[valid]
+
+            # Optional downsampling for performance
+            max_points_scene = 150000
+            num_valid = uu_valid.shape[0]
+            if num_valid > max_points_scene:
+                sel = np.random.choice(num_valid, max_points_scene, replace=False)
+                uu_valid = uu_valid[sel]
+                vv_valid = vv_valid[sel]
+                z_valid = z_valid[sel]
+
+            x = (uu_valid - cx) * z_valid / fx
+            y = (vv_valid - cy) * z_valid / fy
+            pts = np.stack([x, y, z_valid], axis=1)
+
+            # Colors from RGB
+            if rgb_image is not None and rgb_image.size > 0:
+                if rgb_image.dtype != np.uint8:
+                    rgb_u8 = np.clip(rgb_image, 0, 255).astype(np.uint8)
+                else:
+                    rgb_u8 = rgb_image
+                rgb_flat = rgb_u8.reshape(-1, 3)
+                # Map 2D indices to flat indices
+                flat_idx = (vv_valid.astype(np.int64) * W + uu_valid.astype(np.int64)).astype(np.int64)
+                flat_idx = np.clip(flat_idx, 0, rgb_flat.shape[0] - 1)
+                colors_sel = rgb_flat[flat_idx]
+                colors_list = [f"rgb({int(c[0])},{int(c[1])},{int(c[2])})" for c in colors_sel]
+                marker_kwargs = dict(size=2, color=colors_list, opacity=0.7)
             else:
-                scene_vertex_colors_pc = None
-        else:
-            scene_vertices_pc = scene_vertices
-            scene_vertex_colors_pc = scene_vertex_colors
+                marker_kwargs = dict(size=2, color='lightblue', opacity=0.7)
 
-        # Prepare marker colors
-        if scene_vertex_colors_pc is not None and len(scene_vertex_colors_pc) == len(scene_vertices_pc):
-            if scene_vertex_colors_pc.max() <= 1.0:
-                colors_rgb = scene_vertex_colors_pc
-            else:
-                colors_rgb = scene_vertex_colors_pc / 255.0
-            colors_list = [f"rgb({int(c[0]*255)},{int(c[1]*255)},{int(c[2]*255)})" for c in colors_rgb]
-            marker_kwargs = dict(size=2, color=colors_list, opacity=0.7)
-        else:
-            marker_kwargs = dict(size=2, color='lightblue', opacity=0.7)
-
-        traces.append(go.Scatter3d(
-            x=scene_vertices_pc[:, 0],
-            y=scene_vertices_pc[:, 1],
-            z=scene_vertices_pc[:, 2],
-            mode='markers',
-            marker=marker_kwargs,
-            name='Scene Point Cloud',
-            showlegend=True
-        ))
+            traces.append(go.Scatter3d(
+                x=pts[:, 0],
+                y=pts[:, 1],
+                z=pts[:, 2],
+                mode='markers',
+                marker=marker_kwargs,
+                name='Scene Point Cloud',
+                showlegend=True
+            ))
 
     # Robot 링크 메시를 Mesh3d로 표시
     colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown', 'pink', 'cyan']
@@ -2123,10 +2135,10 @@ def build_robot_3d_visualization_traces_point_cloud(scene_mesh, robot_meshes, qu
     return traces
 
 
-def create_robot_3d_visualization_plotly_animate_point_cloud(scene_mesh, robot_meshes_list, query_points, viewpoint_matrix, viewdirection_matrix, visibility_results, robot_joint_angles_list, save_path, robot_viz=None, image_size=None, K_adjusted=None):
+def create_robot_3d_visualization_plotly_animate_point_cloud(scene_mesh, robot_meshes_list, query_points, viewpoint_matrix, viewdirection_matrix, visibility_results, robot_joint_angles_list, save_path, robot_viz=None, image_size=None, K_adjusted=None, rgb_image=None, depth_image=None):
     """
     create_robot_3d_visualization_plotly_animate와 동일하나,
-    Scene/Robot mesh를 포인트 클라우드로 표시하여 애니메이션 생성
+    Scene은 RGB-D로부터 포인트 클라우드로 표시, Robot은 Mesh로 표시하여 애니메이션 생성
     """
     M, L = viewpoint_matrix.shape[:2]
 
@@ -2159,8 +2171,8 @@ def create_robot_3d_visualization_plotly_animate_point_cloud(scene_mesh, robot_m
             })
 
         traces = build_robot_3d_visualization_traces_point_cloud(
-            scene_mesh, current_robot_meshes, query_points, viewpoint_matrix[:, robot_idx], viewdirection_matrix[:, robot_idx],
-            current_robot_results, current_joint_angles, robot_viz, image_size, K_adjusted
+            current_robot_meshes, query_points, viewpoint_matrix[:, robot_idx], viewdirection_matrix[:, robot_idx],
+            current_robot_results, current_joint_angles, robot_viz, image_size, K_adjusted, rgb_image, depth_image
         )
 
         frames.append(go.Frame(
@@ -2813,7 +2825,8 @@ def main():
         CANDIDATE_VIEWPOINTS_MATRIX, CANDIDATE_ROTATIONS_MATRIX,
         visibility_results, robot_joint_angles_list,
         "visibility_test_output/3d_visualization_animate_point_cloud.html",
-        robot_viz, image_size, K_adjusted
+        robot_viz, image_size, K_adjusted,
+        rgb_image=rgb_resized, depth_image=depth_m
     )
     vprint("Animated 3D point cloud visualization saved to: visibility_test_output/3d_visualization_animate_point_cloud.html")
 
