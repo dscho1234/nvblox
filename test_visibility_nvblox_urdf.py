@@ -386,24 +386,29 @@ class Z1RobotVisualizer:
             
             self.link_transforms['z1_GripperMover'] = gripper_mover_transform
                 
+    
+    
     def transform_mesh_to_world(self, mesh, transform):
         """메시를 월드 좌표계로 변환"""
-        # 메시 복사 (Open3D 방식)
-        start = time.time()
+        
+        # 1. 정점을 직접 변환 (메시 복사 없이)
+        vertices = np.asarray(mesh.vertices)
+        
+        # 2. 변환 행렬을 3x3 회전과 3x1 이동으로 분해하여 더 효율적인 연산
+        rotation = transform[:3, :3]
+        translation = transform[:3, 3]
+        
+        # 3. 벡터화된 변환 (더 효율적)
+        vertices_world = vertices @ rotation.T + translation
+        
+        # 4. 새로운 메시 생성 (최소한의 복사)
         transformed_mesh = o3d.geometry.TriangleMesh()
-        transformed_mesh.vertices = mesh.vertices
         transformed_mesh.triangles = mesh.triangles
-
-        print(f"  In transform_mesh_to_world, time: {time.time() - start:.4f} seconds")
-        # 정점들을 월드 좌표계로 변환
-        vertices = np.asarray(transformed_mesh.vertices)
-        vertices_homogeneous = np.hstack([vertices, np.ones((vertices.shape[0], 1))])
-        vertices_world = (transform @ vertices_homogeneous.T).T[:, :3]
-        print(f"  In transform_mesh_to_world, vertices_world time: {time.time() - start:.4f} seconds")
-        # 변환된 정점으로 메시 업데이트
-        transformed_mesh.vertices = o3d.utility.Vector3dVector(vertices_world)
         transformed_mesh.vertex_colors = mesh.vertex_colors
-        print(f"  In transform_mesh_to_world, vertex_colors time: {time.time() - start:.4f} seconds")
+        
+        # 5. 변환된 정점을 직접 할당
+        transformed_mesh.vertices = o3d.utility.Vector3dVector(vertices_world)
+        
         return transformed_mesh
         
     
@@ -436,7 +441,7 @@ class Z1RobotVisualizer:
                     # T_target이 None이면 월드 좌표계 사용
                     world_mesh = self.transform_mesh_to_world(mesh, self.link_transforms[link_name])
                     transformed_meshes[link_name] = world_mesh
-            print(f"  In get_robot_meshes_in_specified_transform, {link_name} time: {time.time() - start:.4f} seconds")
+            
         return transformed_meshes
 
     def get_coordinate_frames(self, gripper_angle=0.0, frame_size=0.05, joint_angles=None):
@@ -650,6 +655,37 @@ def is_point_in_camera_frustum(point_3d, camera_position, camera_rotation_rpy, c
     width, height = image_size
     return 0 <= u < width and 0 <= v < height
 
+def is_camera_coordinate_point_in_camera_frustum(point_3d, camera_intrinsics, image_size):
+    """
+    3D 포인트가 카메라 frustum 내에 있는지 체크
+    
+    Args:
+        point_3d: 3D 포인트 [x, y, z] (카메라 좌표)
+        camera_intrinsics: 카메라 내부 파라미터 (3x3)
+        image_size: 이미지 크기 (width, height)
+    
+    Returns:
+        bool: 포인트가 frustum 내에 있으면 True
+    """
+    # 1. 월드 좌표를 카메라 좌표로 변환
+    point_cam = np.array(point_3d, dtype=np.float64)
+    
+    # 2. 카메라 좌표에서 이미지 평면으로 투영
+    if point_cam[2] <= 0:  # 카메라 뒤쪽에 있으면 보이지 않음
+        return False
+    
+    # 투영
+    fx, fy = camera_intrinsics[0, 0], camera_intrinsics[1, 1]
+    cx, cy = camera_intrinsics[0, 2], camera_intrinsics[1, 2]
+    
+    u = fx * point_cam[0] / point_cam[2] + cx
+    v = fy * point_cam[1] / point_cam[2] + cy
+    
+    # 3. 이미지 경계 내에 있는지 체크
+    width, height = image_size
+    return 0 <= u < width and 0 <= v < height
+
+
 
 def create_camera_frustum_visualization(camera_position, camera_rotation_rpy, camera_intrinsics, image_size, max_distance=0.5):
     """
@@ -808,6 +844,10 @@ def load_data_from_zarr(buffer_path, episode_idx):
     relative_poses = convert_to_relative(T_mc_transformation[None])[0] # [T, 4, 4]
 
     action = episode["action"][:].copy() # [T, 7]
+    tracking_3d = np.transpose(episode["dift_point_tracking_sequence"][:, :, :3], (1, 0, 2)) # [T, N, 3(or 4)]
+    assert rgb_frames.shape[0] == action.shape[0] == tracking_3d.shape[0] == T_mc_transformation.shape[0], f"rgb_frames.shape: {rgb_frames.shape}, action.shape: {action.shape}, tracking_3d.shape: {tracking_3d.shape}, T_mc_transformation.shape: {T_mc_transformation.shape}"
+
+
     combined_mask = None
     if USE_FAKE_DEPTH:
         # assert cfg.use_video, "When you use HaMeR related outputs, you should consider that some frames are cut, and the logging should start from the first hand-detected frames"
@@ -833,9 +873,9 @@ def load_data_from_zarr(buffer_path, episode_idx):
     print(f"rgb_frames.shape: {rgb_frames.shape}")
     print(f"depth_frames.shape: {depth_frames.shape}")
     print(f"relative_poses.shape: {relative_poses.shape}")
-    return rgb_frames, depth_frames, relative_poses, combined_mask, T_mc_transformation, action
+    return rgb_frames, depth_frames, relative_poses, combined_mask, T_mc_transformation, action, tracking_3d
 
-def get_data(rgb_frames, depth_frames, relative_poses, combined_mask, T_mc_transformation, action, frame_idx, depth_scale=0.001):
+def get_data(rgb_frames, depth_frames, relative_poses, combined_mask, T_mc_transformation, action, tracking_3d, frame_idx, depth_scale=0.001):
     
 
     fake_depth_mask = None
@@ -850,11 +890,11 @@ def get_data(rgb_frames, depth_frames, relative_poses, combined_mask, T_mc_trans
     relative_pose = relative_poses[frame_idx]
     T_mc = T_mc_transformation[frame_idx]
     act = action[frame_idx]    
-
+    track_3d = tracking_3d[frame_idx]
     
             
     
-    return rgb, depth_m, fake_depth_mask, relative_pose, T_mc, act
+    return rgb, depth_m, fake_depth_mask, relative_pose, T_mc, act, track_3d
 
 
 def radial_depth_to_z_depth(radial_depth, intrinsics):
@@ -2471,7 +2511,7 @@ class CustomVisualizerV3(Visualizer):
         
         
 
-def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, relative_poses_list, K_adjusted_list, T_mc_list, action_list, robot_viz=None, voxel_size=0.01, export_interactive_html=True, query_points_3d=None, image_size=None):
+def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, relative_poses_list, K_adjusted_list, T_mc_list, action_list, tracking_3d_list, robot_viz=None, voxel_size=0.01, export_interactive_html=True, image_size=None):
     """
     sun3d.py 방식을 차용한 nvblox 기반 multiframe 시각화 함수
     - Mapper를 한 번 생성하고 모든 프레임을 순차적으로 처리
@@ -2534,6 +2574,7 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, rela
         action_se3[:3, 3] = action[:3]
         action_se3[:3, :3] = R.from_euler('xyz', action[3:6], degrees=False).as_matrix()
         gripper_action = action[6]
+        tracking_3d = tracking_3d_list[frame_idx] # [N, 3]
         
         
 
@@ -2582,6 +2623,11 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, rela
         ])
         
         T_B_C = T_B_M @ T_mc
+        
+        T_mw = T_mc_list[0].copy()
+        T_W_B = np.linalg.inv(T_B_M @ T_mw)
+        T_W_C = np.linalg.inv(T_mw) @ T_mc
+        
 
         
         robot_viz.set_joint_angles([0, 0, 0, 0, 0, 0])
@@ -2595,7 +2641,7 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, rela
         ik_success = robot_viz.solve_inverse_kinematics(action_se3, gripper_angle=gripper_angle)
         print(f"  IK success: {ik_success}")
         start = time.time()
-        robot_meshes = robot_viz.get_robot_meshes_in_specified_transform(gripper_angle=gripper_angle, T_target=np.linalg.inv(T_B_C))
+        robot_meshes = robot_viz.get_robot_meshes_in_specified_transform(gripper_angle=gripper_angle, T_target=T_W_B) # np.linalg.inv(T_B_C)
         print(f"  In multiframe example, Robot meshes time: {time.time() - start:.4f} seconds")
 
         
@@ -2610,11 +2656,9 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, rela
         if len(combined_mesh.triangles) == 0:
             print("  WARNING: Combined mesh has no triangles!")
         
-        visibility_results = np.zeros((N_QUERY_POINTS), dtype=bool)  # True if visible, False if occluded
-        hit_distances = np.zeros((N_QUERY_POINTS), dtype=np.float64)  # Hit distances for each viewpoint and query point
+        visibility_results = np.zeros((tracking_3d.shape[0]), dtype=bool)  # True if visible, False if occluded
+        hit_distances = np.zeros((tracking_3d.shape[0]), dtype=np.float64)  # Hit distances for each viewpoint and query point
 
-        robot_idx = 0
-        vprint(f"\n=== Checking robot {robot_idx + 1} (column {robot_idx}) ===")
         
         mesh_tensor = o3d.t.geometry.TriangleMesh.from_legacy(combined_mesh)
         
@@ -2623,7 +2667,6 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, rela
         current_scene.add_triangles(mesh_tensor)
         
         
-        # 현재 robot_idx에 해당하는 column의 viewpoints들을 모음: CANDIDATE_VIEWPOINTS_MATRIX[:, robot_idx]
         viewpoints_for_this_robot = relative_pose[:3, 3] 
         viewdirections_for_this_robot = R.from_matrix(relative_pose[:3, :3]).as_euler('xyz', degrees=True)
         vprint(f"  Viewpoints for this robot: {viewpoints_for_this_robot.shape} (M viewpoints)")
@@ -2631,19 +2674,25 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, rela
         # Batch raycasting 방식 (미리 생성된 scene 사용)
         vprint(f"  Performing batch raycasting for {M} viewpoints...")
         
-        set_idx = 0
-    
+        
+        # NOTE: this is assumed to be in slam's world coordinate (first frame is the world)
         viewpoint = viewpoints_for_this_robot
         viewdirection = viewdirections_for_this_robot  # [roll, pitch, yaw] in degrees
         
-        print(f"    Set {set_idx + 1}: {viewpoint} {viewdirection}")
+        print(f" view:{viewpoint} {viewdirection}")
         
+        query_point_in_world_coordinate = []
         # N개의 쿼리 포인트에 대해 visibility 체크
-        for query_idx in range(N_QUERY_POINTS):
-            query_point = query_points_3d[query_idx] # + 0.05 * frame_idx # debug
+        for query_idx in range(tracking_3d.shape[0]): 
+            
+            # assume it is in camera coordinate
+            query_point_homo = np.concatenate([tracking_3d[query_idx], [1]])[:, None] # [4, 1]
+            # convert to world coordinate
+            query_point = (T_W_C @ query_point_homo)[:3, 0] # [3]
+            query_point_in_world_coordinate.append(query_point.copy())
             
             # 1. LOS 체크 (기존 raycasting)
-            direction = query_point - viewpoint
+            direction = query_point - viewpoint # NOTE: this is valid only when both variables are in the same coordinate
             distance = np.linalg.norm(direction)
             direction_normalized = direction / distance
             
@@ -2659,10 +2708,13 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, rela
             los_hit_distance = los_hit_distances[0]
             
             # 2. 카메라 frustum 체크
-            # 미리 계산된 카메라 파라미터 사용
             frustum_visible = is_point_in_camera_frustum(
                 query_point, viewpoint, viewdirection, K_frame, image_size
             )
+            
+            # frustum_visible = is_camera_coordinate_point_in_camera_frustum(
+            #     query_point, K_frame, image_size
+            # )
             
             # 3. 최종 visibility: LOS 체크와 frustum 체크를 모두 통과해야 함
             final_visible = los_visible and frustum_visible
@@ -2686,14 +2738,14 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, rela
         
         # CustomVisualizerV3가 로봇 메시와 씬 메시를 결합하여 시각화
         # visualize 함수에 LOS 관련 매개변수 전달 (옵션)
-        # visualizer.visualize(
-        #     color_mesh=combined_mesh, 
-        #     camera_pose=pose_tensor,
-        #     query_points=query_points_3d,  # None이면 LOS 시각화 안함
-        #     visibility_results=visibility_results,  # None이면 LOS 시각화 안함
-        #     camera_intrinsics=K_frame,  # 카메라 내부 파라미터
-        #     image_size=image_size  # 이미지 크기
-        # )
+        visualizer.visualize(
+            color_mesh=combined_mesh, 
+            camera_pose=pose_tensor,
+            query_points=np.stack(query_point_in_world_coordinate), # [N, 3]  # None이면 LOS 시각화 안함
+            visibility_results=visibility_results,  # None이면 LOS 시각화 안함
+            camera_intrinsics=K_frame,  # 카메라 내부 파라미터
+            image_size=image_size  # 이미지 크기
+        )
         
         # Interactive HTML export를 위한 데이터 저장
         if export_interactive_html:
@@ -2976,8 +3028,8 @@ def main():
     # 1) 입력 로드
     vprint("\n=== 1. Loading RGB-D Data ===")
     load_start_time = time.time()
-    rgb_frames, depth_frames, relative_poses, combined_mask, T_mc_transformation, action = load_data_from_zarr(BUFFER_PATH, EPISODE_IDX)
-    rgb, depth_raw, fake_depth_mask, relative_pose, T_mc, act = get_data(rgb_frames, depth_frames, relative_poses, combined_mask, T_mc_transformation, action, FRAME_IDX, DEPTH_SCALE)
+    rgb_frames, depth_frames, relative_poses, combined_mask, T_mc_transformation, action, tracking_3d = load_data_from_zarr(BUFFER_PATH, EPISODE_IDX)
+    rgb, depth_raw, fake_depth_mask, relative_pose, T_mc, act, track_3d = get_data(rgb_frames, depth_frames, relative_poses, combined_mask, T_mc_transformation, action, tracking_3d, FRAME_IDX, DEPTH_SCALE)
     H, W = depth_raw.shape
     load_end_time = time.time()
     vprint(f"Loaded RGB: {rgb.shape}, Depth: {depth_raw.shape}")
@@ -3096,7 +3148,7 @@ def main():
             # 홈 포지션으로 초기화
             robot_viz.set_joint_angles([0, 0, 0, 0, 0, 0])
 
-            # dscho debug
+            
             gripper_angle = -np.pi/2 # unit : (radian), 0 closed, -1 open (should check the maximum radian values of the robot)
             
             # Inverse Kinematics로 조인트 각도 계산
@@ -3108,7 +3160,6 @@ def main():
                 # 로봇의 모든 링크 메시를 월드 좌표계로 변환하여 가져오기
                 start = time.time()
                 robot_meshes = robot_viz.get_robot_meshes_in_specified_transform(gripper_angle=gripper_angle)
-                print(f"  @@@@@ for debug, Robot meshes time: {time.time() - start:.4f} seconds")
                 time.sleep(1)
                 robot_meshes_list.append(robot_meshes)
                 robot_joint_angles_list.append(robot_viz.joint_angles.copy())
@@ -3466,19 +3517,20 @@ def main():
 
     # Multi-frame scene mesh 애니메이션을 위한 RGB-D 데이터 로드
     vprint("\nLoading multiple frames for multiframe visualization...")
-    num_multiframe_frames = 300  # 디버깅을 위해 매우 적게 설정
+    num_multiframe_frames = 250  # 디버깅을 위해 매우 적게 설정
     rgb_frames_list = []
     depth_frames_list = []
     relative_poses_list = []
     K_adjusted_list = []
     T_mc_list = []
     action_list = []
+    tracking_3d_list = []
     
     for frame_offset in range(num_multiframe_frames):
         current_frame_idx = FRAME_IDX + frame_offset
         
         # RGB-D 데이터 로드
-        rgb, depth_raw, fake_depth_mask, relative_pose, T_mc, act = get_data(rgb_frames, depth_frames, relative_poses, combined_mask, T_mc_transformation, action, current_frame_idx, DEPTH_SCALE)
+        rgb, depth_raw, fake_depth_mask, relative_pose, T_mc, act, track_3d = get_data(rgb_frames, depth_frames, relative_poses, combined_mask, T_mc_transformation, action, tracking_3d, current_frame_idx, DEPTH_SCALE)
         # 1.5) 이미지 리사이즈 (옵션) - UniDepth 사용시에는 RGB만 리사이즈
         if RESIZE:
             rgb_resized, _, scale_factor_x, scale_factor_y = resize_image_and_depth(rgb, depth_raw, RESIZE_SIZE)
@@ -3494,6 +3546,7 @@ def main():
         K_adjusted_list.append(K_adjusted)
         T_mc_list.append(T_mc)
         action_list.append(act)
+        tracking_3d_list.append(track_3d)
         vprint(f"  Loaded frame {frame_offset + 1}/{num_multiframe_frames} (index: {current_frame_idx})")
             
     vprint(f"Successfully loaded {len(rgb_frames_list)} frames for multiframe visualization")
@@ -3504,11 +3557,10 @@ def main():
     if len(rgb_frames_list) > 0:
         create_multiframe_nvblox(
             "visibility_test_output/3d_visualization_animate_multiframe_nvblox.ply",
-            rgb_frames_list, depth_frames_list, relative_poses_list, K_adjusted_list, T_mc_list, action_list,
+            rgb_frames_list, depth_frames_list, relative_poses_list, K_adjusted_list, T_mc_list, action_list, tracking_3d_list,
             robot_viz=robot_viz,
             voxel_size=VOXEL_SIZE,
             export_interactive_html=False,  # Interactive HTML export 활성화
-            query_points_3d=query_points_3d,  # LOS 시각화를 위한 쿼리 포인트들
             image_size=image_size,
         )
         vprint("NVBlox multi-frame scene mesh animated visualization saved to: visibility_test_output/3d_visualization_animate_multiframe_nvblox.html")
