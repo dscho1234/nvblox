@@ -8,6 +8,7 @@ import open3d as o3d
 import matplotlib.pyplot as plt
 import torch
 from PIL import Image
+from transforms3d.quaternions import quat2mat
 import zarr
 from tqdm import tqdm
 import time
@@ -34,11 +35,9 @@ from im2flow2act.common.imagecodecs_numcodecs import register_codecs
 from im2flow2act.common.utility.zarr import parallel_reading
 
 # nvblox imports
-from nvblox_torch.mapper import Mapper, QueryType
+from nvblox_torch.mapper import Mapper
 from nvblox_torch.mapper_params import MapperParams, ProjectiveIntegratorParams
-from nvblox_torch.mesh import ColorMesh
-from nvblox_torch.projective_integrator_types import ProjectiveIntegratorType
-
+import open3d as o3d
 
 # ========= Verbose logging control =========
 VERBOSE = False
@@ -69,7 +68,21 @@ class Z1RobotVisualizer:
         self.joint_angles = np.zeros(6)  # 6개 조인트 각도
         self.link_transforms = {}  # 각 링크의 변환 행렬 저장
         self.meshes = {}  # 로드된 메시들 저장
-        
+        # color
+
+        self.link_colors = {
+            'link00': [0.8, 0.2, 0.2],      # 빨간색 (베이스)
+            'link01': [0.2, 0.8, 0.2],         # 초록색 (링크1)
+            'link02': [0.2, 0.2, 0.8],         # 파란색 (링크2)
+            'link03': [0.8, 0.8, 0.2],         # 노란색 (링크3)
+            'link04': [0.8, 0.2, 0.8],         # 자홍색 (링크4)
+            'link05': [0.2, 0.8, 0.8],         # 청록색 (링크5)
+            'link06': [0.5, 0.5, 0.5],         # 회색 (링크6)
+            'z1_GripperMover': [0.9, 0.5, 0.1],   # 주황색 (그리퍼)
+            'z1_GripperStator': [0.9, 0.5, 0.1],  # 주황색 (그리퍼)
+        }
+
+
         # Unitree Z1 SDK 초기화
         try:
             self.arm_interface = unitree_arm_interface.ArmInterface(hasGripper=True)
@@ -124,6 +137,7 @@ class Z1RobotVisualizer:
                                     # STL 파일 로드
                                     mesh_obj = o3d.io.read_triangle_mesh(stl_path)
                                     if len(mesh_obj.vertices) > 0:
+                                        mesh_obj.vertex_colors = o3d.utility.Vector3dVector(np.tile(np.array(self.link_colors[link_name])[None, :], (len(mesh_obj.vertices), 1)))
                                         self.meshes[link_name] = mesh_obj
                                         vprint(f"STL 메시 로드 성공: {link_name} -> {stl_path} ({len(mesh_obj.vertices)} vertices)")
                                         continue
@@ -167,6 +181,7 @@ class Z1RobotVisualizer:
                 if os.path.exists(stl_path):
                     mesh_obj = o3d.io.read_triangle_mesh(stl_path)
                     if len(mesh_obj.vertices) > 0:
+                        mesh_obj.vertex_colors = o3d.utility.Vector3dVector(np.tile(np.array(self.link_colors[gripper_name])[None, :], (len(mesh_obj.vertices), 1)))            
                         self.meshes[gripper_name] = mesh_obj
                         vprint(f"Gripper STL 메시 로드 성공: {gripper_name} -> {stl_path} ({len(mesh_obj.vertices)} vertices)")
                         continue
@@ -374,18 +389,21 @@ class Z1RobotVisualizer:
     def transform_mesh_to_world(self, mesh, transform):
         """메시를 월드 좌표계로 변환"""
         # 메시 복사 (Open3D 방식)
+        start = time.time()
         transformed_mesh = o3d.geometry.TriangleMesh()
         transformed_mesh.vertices = mesh.vertices
         transformed_mesh.triangles = mesh.triangles
-        
+
+        print(f"  In transform_mesh_to_world, time: {time.time() - start:.4f} seconds")
         # 정점들을 월드 좌표계로 변환
         vertices = np.asarray(transformed_mesh.vertices)
         vertices_homogeneous = np.hstack([vertices, np.ones((vertices.shape[0], 1))])
         vertices_world = (transform @ vertices_homogeneous.T).T[:, :3]
-        
+        print(f"  In transform_mesh_to_world, vertices_world time: {time.time() - start:.4f} seconds")
         # 변환된 정점으로 메시 업데이트
         transformed_mesh.vertices = o3d.utility.Vector3dVector(vertices_world)
-        
+        transformed_mesh.vertex_colors = mesh.vertex_colors
+        print(f"  In transform_mesh_to_world, vertex_colors time: {time.time() - start:.4f} seconds")
         return transformed_mesh
         
     
@@ -404,6 +422,7 @@ class Z1RobotVisualizer:
         
         transformed_meshes = {}
         for link_name, mesh in self.meshes.items():
+            start = time.time()
             if link_name in self.link_transforms:
                 if T_target is not None:
                     # 월드 좌표계에서 목표 좌표계로 변환
@@ -417,7 +436,7 @@ class Z1RobotVisualizer:
                     # T_target이 None이면 월드 좌표계 사용
                     world_mesh = self.transform_mesh_to_world(mesh, self.link_transforms[link_name])
                     transformed_meshes[link_name] = world_mesh
-        
+            print(f"  In get_robot_meshes_in_specified_transform, {link_name} time: {time.time() - start:.4f} seconds")
         return transformed_meshes
 
     def get_coordinate_frames(self, gripper_angle=0.0, frame_size=0.05, joint_angles=None):
@@ -487,8 +506,8 @@ class Z1RobotVisualizer:
 # ========= 사용자 설정 =========
 # Zarr 데이터 경로 설정
 BUFFER_PATH = "/home/dscho1234/fast_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/single_marker_bottle_under_table_wilor"
-EPISODE_IDX = 0
-FRAME_IDX = 50  # 특정 프레임 선택
+EPISODE_IDX = 2
+FRAME_IDX = 0  # 특정 프레임 선택
 DEPTH_SCALE = 0.001        # 깊이 단위 → 미터 변환 (예: mm면 0.001, 이미 m면 1.0)
 OFFSET_DISTANCE = 0.05 # for convex part of the constructed mesh
 
@@ -512,7 +531,7 @@ else:  # low_resolution
 vprint(f"Using {MESH_QUALITY}: voxel_size={VOXEL_SIZE}m")
 
 # Depth estimation 설정
-USE_MONODEPTH = True  # True: UniDepth 사용, False: raw depth 사용
+USE_MONODEPTH = False # True  # True: UniDepth 사용, False: raw depth 사용
 MODEL_TYPE = "l"  # UniDepth model type: s, b, l
 
 
@@ -520,7 +539,7 @@ USE_FAKE_DEPTH = True
 FAKE_DEPTH_VALUE = 0
 
 # 이미지 리사이즈 설정
-RESIZE = True  # True: 이미지를 256x256으로 리사이즈, False: 원본 크기 사용
+RESIZE = True # True: 이미지를 256x256으로 리사이즈, False: 원본 크기 사용
 RESIZE_SIZE = (256, 256)  # 리사이즈할 크기 (width, height)
 IMAGE_SIZE = (640, 480)
 # (중요) 카메라 내파라미터: 사용자가 직접 채우세요.
@@ -561,7 +580,7 @@ CANDIDATE_ROTATIONS = [
 M = 10 # 3  # M개의 viewpoint set
 L = len(CANDIDATE_VIEWPOINTS)  # L개의 viewpoints per set
 
-
+DEBUG = False # True
 
 vprint(f"Creating {M} viewpoint sets, each with {L} viewpoints")
 vprint(f"Total viewpoints: {M} x {L} = {M*L}")
@@ -573,7 +592,21 @@ CANDIDATE_ROTATIONS_MATRIX = np.array([CANDIDATE_ROTATIONS for _ in range(M)])
 vprint(f"Candidate viewpoints matrix shape: {CANDIDATE_VIEWPOINTS_MATRIX.shape}")
 vprint(f"Candidate rotations matrix shape: {CANDIDATE_ROTATIONS_MATRIX.shape}")
 
-
+def convert_to_relative(se3_matrices):
+    # SE(3) matrices [B, H, 4, 4]
+    
+    # Get inverse of first transformation for each batch [B, 4, 4]
+    first_transforms = se3_matrices[:, 0]  # [B, 4, 4]
+    first_inv = np.linalg.inv(first_transforms)  # [B, 4, 4]
+    
+    # Apply relative transformation: T_rel = T_first_inv @ T_current
+    # Broadcasting: [B, 4, 4] @ [B, H, 4, 4] -> [B, H, 4, 4]
+    relative_se3 = np.einsum('bij,bhjk->bhik', first_inv, se3_matrices)
+    
+    # Set first index to identity
+    relative_se3[:, 0] = np.eye(4)
+    
+    return relative_se3
 
 
 # ========= 카메라 Frustum 체크 함수 =========
@@ -618,7 +651,7 @@ def is_point_in_camera_frustum(point_3d, camera_position, camera_rotation_rpy, c
     return 0 <= u < width and 0 <= v < height
 
 
-def create_camera_frustum_visualization(camera_position, camera_rotation_rpy, camera_intrinsics, image_size, max_distance=1.0):
+def create_camera_frustum_visualization(camera_position, camera_rotation_rpy, camera_intrinsics, image_size, max_distance=0.5):
     """
     카메라 frustum을 시각화하기 위한 8개 꼭짓점 생성
     
@@ -751,7 +784,7 @@ def apply_fake_depth_to_mask(depths, mask, fake_value):
     
     return modified_depths
 
-def load_rgbd_from_zarr(buffer_path, episode_idx, frame_idx, depth_scale=0.001):
+def load_data_from_zarr(buffer_path, episode_idx):
     """Zarr에서 RGB와 depth 데이터를 불러오는 함수"""
     register_codecs()
     
@@ -770,10 +803,12 @@ def load_rgbd_from_zarr(buffer_path, episode_idx, frame_idx, depth_scale=0.001):
         group=episode["camera_0"],
         array_name="depth",
     )
-    print(f"rgb_frames.shape: {rgb_frames.shape}")
-    print(f"depth_frames.shape: {depth_frames.shape}")
 
-    fake_depth_mask = None
+    T_mc_transformation = episode["T_mc_opt"][:].copy() # [T, 4, 4]
+    relative_poses = convert_to_relative(T_mc_transformation[None])[0] # [T, 4, 4]
+
+    action = episode["action"][:].copy() # [T, 7]
+    combined_mask = None
     if USE_FAKE_DEPTH:
         # assert cfg.use_video, "When you use HaMeR related outputs, you should consider that some frames are cut, and the logging should start from the first hand-detected frames"
         mask = episode["sam_mask_sequence_multi_obj"][:] # [t, num_obj(obj, hand), h, w]
@@ -793,7 +828,18 @@ def load_rgbd_from_zarr(buffer_path, episode_idx, frame_idx, depth_scale=0.001):
         # Any pixel that is 1 in any object becomes 1 in the combined mask
         combined_mask = np.any(mask == 1, axis=1)  # [t, h, w]
         print(f"combined_mask.shape: {combined_mask.shape}")
-        
+
+
+    print(f"rgb_frames.shape: {rgb_frames.shape}")
+    print(f"depth_frames.shape: {depth_frames.shape}")
+    print(f"relative_poses.shape: {relative_poses.shape}")
+    return rgb_frames, depth_frames, relative_poses, combined_mask, T_mc_transformation, action
+
+def get_data(rgb_frames, depth_frames, relative_poses, combined_mask, T_mc_transformation, action, frame_idx, depth_scale=0.001):
+    
+
+    fake_depth_mask = None
+    if USE_FAKE_DEPTH:
         fake_depth_mask = combined_mask[frame_idx]
 
             
@@ -801,13 +847,14 @@ def load_rgbd_from_zarr(buffer_path, episode_idx, frame_idx, depth_scale=0.001):
     rgb = rgb_frames[frame_idx]  # 특정 프레임 선택
     depth_raw = depth_frames[frame_idx]  # 특정 프레임 선택
     depth_m = depth_raw.astype(np.float32) * depth_scale
-    
-    
+    relative_pose = relative_poses[frame_idx]
+    T_mc = T_mc_transformation[frame_idx]
+    act = action[frame_idx]    
 
     
             
     
-    return rgb, depth_m, fake_depth_mask
+    return rgb, depth_m, fake_depth_mask, relative_pose, T_mc, act
 
 
 def radial_depth_to_z_depth(radial_depth, intrinsics):
@@ -998,7 +1045,7 @@ def pick_query_pixel(depth_m):
 
 
 # ========= nvblox 기반 메시 생성 =========
-def create_mesh_with_nvblox(depth_image, rgb_image, K, voxel_size=0.005, max_integration_distance=5.0, return_mapper=False, mapper=None):
+def create_mesh_with_nvblox(depth_image, rgb_image, K, pose, voxel_size=0.005, max_integration_distance=5.0, return_mapper=False, mapper=None):
     """
     nvblox를 사용하여 3D 메시 생성
     
@@ -1028,8 +1075,11 @@ def create_mesh_with_nvblox(depth_image, rgb_image, K, voxel_size=0.005, max_int
     # 카메라 내부 파라미터를 torch tensor로 변환 (CPU)
     intrinsics_tensor = torch.from_numpy(K.astype(np.float32)).cpu()
     
-    # 카메라 포즈 (identity matrix, CPU)
-    pose_tensor = torch.eye(4, dtype=torch.float32).cpu()
+    # 카메라 포즈
+    if pose is None:
+        pose_tensor = torch.eye(4, dtype=torch.float32).cpu()
+    else:
+        pose_tensor = torch.from_numpy(pose.astype(np.float32)).cpu()
     
     # Mapper 재사용 또는 새로 생성
     if mapper is None:
@@ -1253,12 +1303,12 @@ def create_robot_3d_visualization_plotly(scene_mesh, robot_meshes, query_points,
     
     # 1. Scene 메시 표시
     if len(scene_faces) > 0 and len(scene_vertices) > 0:
-        # Scene mesh를 샘플링 (성능을 위해)
-        if len(scene_faces) > 50000:
-            face_indices = np.random.choice(len(scene_faces), 50000, replace=False)
-            scene_faces_sampled = scene_faces[face_indices]
-        else:
-            scene_faces_sampled = scene_faces
+        # # Scene mesh를 샘플링 (성능을 위해)
+        # if len(scene_faces) > 50000:
+        #     face_indices = np.random.choice(len(scene_faces), 50000, replace=False)
+        #     scene_faces_sampled = scene_faces[face_indices]
+        # else:
+        scene_faces_sampled = scene_faces
         
         # Scene mesh 시각화
         if scene_vertex_colors is not None and len(scene_vertex_colors) > 0:
@@ -1471,7 +1521,7 @@ def create_robot_3d_visualization_plotly(scene_mesh, robot_meshes, query_points,
         
         
         # 함수 파라미터로 전달된 카메라 파라미터 사용
-        max_distance = 1.0  # frustum 최대 거리
+        max_distance = 0.5  # frustum 최대 거리
         
         frustum_vertices = create_camera_frustum_visualization(
             viewpoint, viewdirection, K_adjusted, image_size, max_distance
@@ -1608,11 +1658,11 @@ def build_robot_3d_visualization_traces(scene_mesh, robot_meshes, query_points, 
 
     # 1. Scene 메시 표시
     if len(scene_faces) > 0 and len(scene_vertices) > 0:
-        if len(scene_faces) > 50000:
-            face_indices = np.random.choice(len(scene_faces), 50000, replace=False)
-            scene_faces_sampled = scene_faces[face_indices]
-        else:
-            scene_faces_sampled = scene_faces
+        # if len(scene_faces) > 50000:
+        #     face_indices = np.random.choice(len(scene_faces), 50000, replace=False)
+        #     scene_faces_sampled = scene_faces[face_indices]
+        # else:
+        scene_faces_sampled = scene_faces
 
         if scene_vertex_colors is not None and len(scene_vertex_colors) > 0:
             if scene_vertex_colors.max() <= 1.0:
@@ -1791,7 +1841,7 @@ def build_robot_3d_visualization_traces(scene_mesh, robot_meshes, query_points, 
         if i > 0:
             continue
 
-        max_distance = 1.0
+        max_distance = 0.5
         frustum_vertices = create_camera_frustum_visualization(viewpoint, viewdirection, K_adjusted, image_size, max_distance)
         camera_pos = frustum_vertices[0]
         camera_color = 'blue'
@@ -1982,14 +2032,14 @@ def build_robot_3d_visualization_traces_point_cloud(robot_meshes, query_points, 
             vv_valid = vv[valid].astype(np.float64)
             z_valid = z[valid]
 
-            # Optional downsampling for performance
-            max_points_scene = 150000
-            num_valid = uu_valid.shape[0]
-            if num_valid > max_points_scene:
-                sel = np.random.choice(num_valid, max_points_scene, replace=False)
-                uu_valid = uu_valid[sel]
-                vv_valid = vv_valid[sel]
-                z_valid = z_valid[sel]
+            # # Optional downsampling for performance
+            # max_points_scene = 150000
+            # num_valid = uu_valid.shape[0]
+            # if num_valid > max_points_scene:
+            #     sel = np.random.choice(num_valid, max_points_scene, replace=False)
+            #     uu_valid = uu_valid[sel]
+            #     vv_valid = vv_valid[sel]
+            #     z_valid = z_valid[sel]
 
             x = (uu_valid - cx) * z_valid / fx
             y = (vv_valid - cy) * z_valid / fy
@@ -2158,7 +2208,7 @@ def build_robot_3d_visualization_traces_point_cloud(robot_meshes, query_points, 
         if i > 0:
             continue
 
-        max_distance = 1.0
+        max_distance = 0.5
         frustum_vertices = create_camera_frustum_visualization(viewpoint, viewdirection, K_adjusted, image_size, max_distance)
         camera_pos = frustum_vertices[0]
         camera_color = 'blue'
@@ -2205,6 +2255,492 @@ def build_robot_3d_visualization_traces_point_cloud(robot_meshes, query_points, 
             ))
 
     return traces
+
+from nvblox_torch.examples.utils.visualization import Visualizer
+class CustomVisualizerV3(Visualizer):
+        """
+        Custom visualizer that combines robot mesh with scene mesh in _visualize_nvblox_mesh
+        and adds Line of Sight (LOS) visualization functionality
+        """
+        def __init__(self, deep_feature_embedding_dim=None):
+            super().__init__(deep_feature_embedding_dim)
+            self.los_geometries = {}  # Store LOS geometries for each visualizer
+            self.camera_frustum_geometries = {}  # Store camera frustum geometries for each visualizer
+            self.query_points = None
+            self.camera_center = None
+            self.visibility_results = None
+            self.camera_intrinsics = None
+            self.image_size = None
+        
+        def _create_visualizer(self, window_name: str):
+            """Create visualizer with custom settings for LOS visualization"""
+            import open3d as o3d
+            import numpy as np
+            
+            visualizer = o3d.visualization.VisualizerWithKeyCallback()
+            visualizer.create_window(width=800, height=600, window_name=window_name)
+            visualizer.get_render_option().line_width = 5  # LOS 선을 더 두껍게
+            visualizer.get_render_option().point_size = 3
+            visualizer.get_render_option().background_color = np.asarray([0, 0, 0])
+            visualizer.register_key_callback(ord(' '), lambda vis: self._toggle_pause(vis))
+            return visualizer
+        
+        def _visualize_nvblox_mesh(self, color_mesh, name='color_mesh'):
+            if name not in self.visualizers:
+                self.visualizers[name] = self._create_visualizer(name)
+            self.visualizers[name].clear_geometries()
+            self.visualizers[name].add_geometry(color_mesh)
+            self.visualizers[name].update_renderer()
+        
+        def create_multiple_lines_of_sight(self, camera_center, target_points, colors=None):
+            """
+            카메라 중심에서 여러 타겟 포인트까지의 line of sight들을 생성
+            
+            Args:
+                camera_center: 카메라 중심 좌표
+                target_points: 타겟 포인트들의 리스트
+                colors: 각 선의 색깔 리스트 (None이면 기본 색깔 사용)
+            
+            Returns:
+                o3d.geometry.LineSet: 모든 line of sight를 포함하는 LineSet
+            """
+            
+            
+            if colors is None:
+                colors = [[1, 0, 0]] * len(target_points)  # 기본적으로 빨간색
+            
+            points = [camera_center]
+            lines = []
+            line_colors = []
+            
+            for i, target_point in enumerate(target_points):
+                points.append(target_point)
+                lines.append([0, i + 1])  # 카메라 중심(0)에서 각 타겟 포인트로
+                line_colors.append(colors[i])
+            
+            line_set = o3d.geometry.LineSet()
+            line_set.points = o3d.utility.Vector3dVector(np.array(points))
+            line_set.lines = o3d.utility.Vector2iVector(np.array(lines))
+            line_set.colors = o3d.utility.Vector3dVector(np.array(line_colors))
+            
+            return line_set
+        
+        def create_camera_frustum_geometry(self, camera_pose, camera_intrinsics, image_size, max_distance=0.5):
+            """
+            카메라 frustum을 Open3D geometry로 생성
+            
+            Args:
+                camera_pose: 카메라 pose (4x4 변환 행렬)
+                camera_intrinsics: 카메라 내부 파라미터 (3x3)
+                image_size: 이미지 크기 (width, height)
+                max_distance: frustum의 최대 거리
+            
+            Returns:
+                o3d.geometry.LineSet: 카메라 frustum을 나타내는 LineSet
+            """
+            
+            
+            # 카메라 위치와 회전 추출
+            camera_position = camera_pose[:3, 3].cpu().numpy()
+            camera_rotation_matrix = camera_pose[:3, :3].cpu().numpy()
+            camera_rotation_rpy = R.from_matrix(camera_rotation_matrix).as_euler('xyz', degrees=True)
+            
+            # frustum 꼭짓점 생성
+            frustum_vertices = create_camera_frustum_visualization(
+                camera_position, camera_rotation_rpy, camera_intrinsics, image_size, max_distance
+            )
+            
+            # frustum을 LineSet으로 변환
+            # 8개 꼭짓점: 0번은 카메라 중심, 1-4번은 원거리 꼭짓점들
+            points = frustum_vertices
+            lines = [
+                # 카메라 중심에서 각 원거리 꼭짓점으로
+                [0, 1], [0, 2], [0, 3], [0, 4],
+                # 원거리 꼭짓점들을 연결 (사각형)
+                [1, 2], [2, 3], [3, 4], [4, 1]
+            ]
+            
+            line_set = o3d.geometry.LineSet()
+            line_set.points = o3d.utility.Vector3dVector(points)
+            line_set.lines = o3d.utility.Vector2iVector(np.array(lines))
+            line_set.colors = o3d.utility.Vector3dVector(np.array([[0, 1, 1]] * len(lines)))  # 청록색
+            
+            return line_set
+        
+        def _visualize_camera_pose(self, camera_pose):
+            """
+            카메라 frustum을 시각화 (기존 _visualize_camera_pose 오버라이드)
+            """
+            if self.camera_intrinsics is None or self.image_size is None:
+                print("Warning: Camera intrinsics or image size not set, skipping camera frustum visualization")
+                return
+            
+            # 모든 visualizer에 카메라 frustum 추가
+            for name, visualizer in self.visualizers.items():
+                # 기존 카메라 frustum geometry 제거
+                if name in self.camera_frustum_geometries:
+                    visualizer.remove_geometry(self.camera_frustum_geometries[name])
+                
+                # 새로운 카메라 frustum 생성 및 추가
+                frustum_geometry = self.create_camera_frustum_geometry(
+                    camera_pose, self.camera_intrinsics, self.image_size
+                )
+                self.camera_frustum_geometries[name] = frustum_geometry
+                visualizer.add_geometry(frustum_geometry)
+                
+                print(f"Added camera frustum visualization to {name}")
+        
+        
+        def visualize(self, color_mesh=None, feature_mesh=None, camera_pose=None, 
+                     query_points=None, visibility_results=None, camera_intrinsics=None, image_size=None):
+            """
+            LOS를 포함한 시각화 (원래 visualize 함수 오버라이드)
+            
+            Args:
+                color_mesh: Color mesh to visualize
+                feature_mesh: Feature mesh to visualize  
+                camera_pose: Camera pose to visualize
+                query_points: Query points for LOS visualization (옵션)
+                visibility_results: Visibility results for each query point (옵션)
+                camera_intrinsics: Camera intrinsics for frustum visualization (옵션)
+                image_size: Image size for frustum visualization (옵션)
+            """
+            # Store camera intrinsics and image size for frustum visualization
+            if camera_intrinsics is not None:
+                self.camera_intrinsics = camera_intrinsics
+            if image_size is not None:
+                self.image_size = image_size
+            
+            # Initialize view controllers if needed
+            self._initialize_view_controllers_if_needed()
+
+            # Store current views before updating
+            for name, visualizer in self.visualizers.items():
+                if name in self.view_controllers:
+                    self.view_controllers[name].store_camera_pose(visualizer)
+
+            if color_mesh is not None:
+                self._visualize_nvblox_mesh(color_mesh)
+
+            
+            # LOS 시각화 추가 (query_points와 visibility_results가 제공된 경우)
+            if query_points is not None and camera_pose is not None and visibility_results is not None:
+                # 카메라 중심 추출 (camera_pose는 4x4 변환 행렬)
+                camera_center = camera_pose[:3, 3].cpu().numpy()
+                
+                # LOS를 기존 visualizer에 직접 추가
+                for name, visualizer in self.visualizers.items():
+                    # 기존 LOS geometry 제거
+                    if name in self.los_geometries:
+                        visualizer.remove_geometry(self.los_geometries[name])
+                    
+                    # 가시성에 따른 색깔 결정
+                    colors = []
+                    for visible in visibility_results:
+                        if visible:
+                            colors.append([0, 1, 0])  # 초록색 (visible)
+                        else:
+                            colors.append([1, 0, 0])  # 빨간색 (occluded)
+                    
+                    # LOS 생성 및 추가
+                    line_set = self.create_multiple_lines_of_sight(camera_center, query_points, colors)
+                    self.los_geometries[name] = line_set
+                    visualizer.add_geometry(line_set)
+                    
+                    print(f"Added LOS visualization: {len(query_points)} lines from camera to query points")
+            
+            # for name, visualizer in self.visualizers.items():
+            #     visualizer.update_renderer()
+
+
+            if feature_mesh is not None:
+                self._visualize_nvblox_feature_mesh(feature_mesh)
+
+            if camera_pose is not None:
+                self._visualize_camera_pose(camera_pose)
+
+            # Restore views and update
+            for name, visualizer in self.visualizers.items():
+                if name in self.view_controllers:
+                    self.view_controllers[name].restore_viewpoint(visualizer)
+                self._update_visualization(visualizer)
+
+            # Handle pausing
+            if self.pause:
+                self._loop_while_paused()
+        
+        
+
+def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, relative_poses_list, K_adjusted_list, T_mc_list, action_list, robot_viz=None, voxel_size=0.01, export_interactive_html=True, query_points_3d=None, image_size=None):
+    """
+    sun3d.py 방식을 차용한 nvblox 기반 multiframe 시각화 함수
+    - Mapper를 한 번 생성하고 모든 프레임을 순차적으로 처리
+    - 각 프레임마다 mesh를 업데이트하여 애니메이션 생성
+    - robot_meshes_list가 제공되면 첫 번째 로봇 메시를 씬과 결합
+    - export_interactive_html=True이면 interactive HTML로 저장
+    """
+    
+    
+    # 프레임 수 확인
+    num_frames = len(rgb_frames_list)
+    if num_frames == 0:
+        print("No frames provided")
+        return
+    
+    print(f"Processing {num_frames} frame(s) for nvblox multiframe visualization")
+    
+    # nvblox Mapper 설정 (sun3d.py 방식)
+    projective_integrator_params = ProjectiveIntegratorParams()
+    projective_integrator_params.projective_integrator_max_integration_distance_m = 5.0
+    mapper_params = MapperParams()
+    mapper_params.set_projective_integrator_params(projective_integrator_params)
+    
+    # Mapper 생성
+    mapper = Mapper(
+        voxel_sizes_m=voxel_size,
+        mapper_parameters=mapper_params,
+    )
+    from nvblox_torch.examples.utils.visualization import Visualizer
+    from nvblox_torch.examples.utils.feature_extraction import RadioFeatureExtractor
+
+    
+    # CustomVisualizerV3 사용
+    visualizer = CustomVisualizerV3(
+        deep_feature_embedding_dim=RadioFeatureExtractor().embedding_dim()
+    )
+    frames = []
+    
+    # Interactive HTML export를 위한 mesh 저장 리스트
+    interactive_meshes = []
+    camera_poses_for_export = []
+    
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    from transforms3d.quaternions import quat2mat
+
+    # 각 프레임을 순차적으로 처리 (sun3d.py 방식)
+    for frame_idx in range(num_frames):
+        print(f"Processing frame {frame_idx + 1}/{num_frames}")
+        start = time.time()
+        
+        # 현재 프레임의 RGB-D 데이터와 intrinsic 가져오기
+        rgb_frame = rgb_frames_list[frame_idx]
+        depth_frame = depth_frames_list[frame_idx]
+        K_frame = K_adjusted_list[frame_idx]
+        relative_pose = relative_poses_list[frame_idx]
+        T_mc = T_mc_list[frame_idx]
+        action = action_list[frame_idx] # [7]
+        action_se3 = np.eye(4)
+        action_se3[:3, 3] = action[:3]
+        action_se3[:3, :3] = R.from_euler('xyz', action[3:6], degrees=False).as_matrix()
+        gripper_action = action[6]
+        
+        
+
+        # 데이터를 torch tensor로 변환
+        H, W = depth_frame.shape
+        
+        # Depth 이미지를 torch tensor로 변환 (GPU)
+        depth_tensor = torch.from_numpy(depth_frame.astype(np.float32)).cuda()
+        
+        # RGB 이미지를 torch tensor로 변환 (GPU)
+        rgb_tensor = torch.from_numpy(rgb_frame).cuda()
+        
+        # 카메라 내부 파라미터를 torch tensor로 변환 (CPU)
+        intrinsics_tensor = torch.from_numpy(K_frame.astype(np.float32)).cpu()
+        
+        # 카메라 포즈
+        if relative_pose is None:
+            pose_tensor = torch.eye(4, dtype=torch.float32).cpu()
+        else:
+            pose_tensor = torch.from_numpy(relative_pose).float().cpu()
+        
+        
+        # nvblox에 데이터 추가 (sun3d.py 방식)
+        mapper.add_depth_frame(depth_tensor, pose_tensor, intrinsics_tensor)
+        mapper.add_color_frame(rgb_tensor, pose_tensor, intrinsics_tensor)
+        
+        # 메시 업데이트 (각 프레임마다)
+        mapper.update_color_mesh()
+        color_mesh = mapper.get_color_mesh()
+        
+        # nvblox ColorMesh
+        scene_open3d = nvblox_mesh_to_open3d(color_mesh)
+        
+        
+        # 2. 모든 메시를 하나로 결합
+        combined_mesh = scene_open3d
+
+
+
+
+        T_B_M = np.array([
+            [-0.0211232, 0.00961882, -0.99973061, 0.87401688],
+            [ 0.00934025, -0.99990818, -0.00981788,  0.0965125 ],
+            [-0.99973325, -0.00954512,  0.02103141,  0.54736933],
+            [ 0.,          0.,          0.,          1.        ]
+        ])
+        
+        T_B_C = T_B_M @ T_mc
+
+        
+        robot_viz.set_joint_angles([0, 0, 0, 0, 0, 0])
+
+        # dscho debug
+        # NOTE: assume gripper_action is in [0 (open), 1 (close)]
+        # [-1, 0] -> [-np.pi, 0]
+        gripper_angle = (gripper_action-1)*np.pi # unit : (radian)
+        
+        # Inverse Kinematics로 조인트 각도 계산
+        ik_success = robot_viz.solve_inverse_kinematics(action_se3, gripper_angle=gripper_angle)
+        print(f"  IK success: {ik_success}")
+        start = time.time()
+        robot_meshes = robot_viz.get_robot_meshes_in_specified_transform(gripper_angle=gripper_angle, T_target=np.linalg.inv(T_B_C))
+        print(f"  In multiframe example, Robot meshes time: {time.time() - start:.4f} seconds")
+
+        
+        # 3. 각 로봇 링크 메시를 결합
+        for link_name, robot_mesh in robot_meshes.items():
+            if robot_mesh is not None and len(robot_mesh.vertices) > 0:
+                combined_mesh += robot_mesh
+                vprint(f"    Added robot link {link_name}: {len(robot_mesh.vertices)} vertices")
+        
+        if len(combined_mesh.vertices) == 0:
+            print("  WARNING: Combined mesh has no vertices!")
+        if len(combined_mesh.triangles) == 0:
+            print("  WARNING: Combined mesh has no triangles!")
+        
+        visibility_results = np.zeros((N_QUERY_POINTS), dtype=bool)  # True if visible, False if occluded
+        hit_distances = np.zeros((N_QUERY_POINTS), dtype=np.float64)  # Hit distances for each viewpoint and query point
+
+        robot_idx = 0
+        vprint(f"\n=== Checking robot {robot_idx + 1} (column {robot_idx}) ===")
+        
+        mesh_tensor = o3d.t.geometry.TriangleMesh.from_legacy(combined_mesh)
+        
+        # 5. Ray casting scene 생성
+        current_scene = o3d.t.geometry.RaycastingScene()
+        current_scene.add_triangles(mesh_tensor)
+        
+        
+        # 현재 robot_idx에 해당하는 column의 viewpoints들을 모음: CANDIDATE_VIEWPOINTS_MATRIX[:, robot_idx]
+        viewpoints_for_this_robot = relative_pose[:3, 3] 
+        viewdirections_for_this_robot = R.from_matrix(relative_pose[:3, :3]).as_euler('xyz', degrees=True)
+        vprint(f"  Viewpoints for this robot: {viewpoints_for_this_robot.shape} (M viewpoints)")
+        
+        # Batch raycasting 방식 (미리 생성된 scene 사용)
+        vprint(f"  Performing batch raycasting for {M} viewpoints...")
+        
+        set_idx = 0
+    
+        viewpoint = viewpoints_for_this_robot
+        viewdirection = viewdirections_for_this_robot  # [roll, pitch, yaw] in degrees
+        
+        print(f"    Set {set_idx + 1}: {viewpoint} {viewdirection}")
+        
+        # N개의 쿼리 포인트에 대해 visibility 체크
+        for query_idx in range(N_QUERY_POINTS):
+            query_point = query_points_3d[query_idx] # + 0.05 * frame_idx # debug
+            
+            # 1. LOS 체크 (기존 raycasting)
+            direction = query_point - viewpoint
+            distance = np.linalg.norm(direction)
+            direction_normalized = direction / distance
+            
+            # 단일 ray에 대한 raycasting
+            origins_single = viewpoint.reshape(1, 3)
+            directions_single = direction_normalized.reshape(1, 3)
+            distances_single = np.array([distance - OFFSET_DISTANCE])
+            
+            los_visible, los_hit_distances = batch_raycasting_with_scene(
+                current_scene, origins_single, directions_single, distances_single
+            )
+            los_visible = los_visible[0]
+            los_hit_distance = los_hit_distances[0]
+            
+            # 2. 카메라 frustum 체크
+            # 미리 계산된 카메라 파라미터 사용
+            frustum_visible = is_point_in_camera_frustum(
+                query_point, viewpoint, viewdirection, K_frame, image_size
+            )
+            
+            # 3. 최종 visibility: LOS 체크와 frustum 체크를 모두 통과해야 함
+            final_visible = los_visible and frustum_visible
+            
+            # 결과 저장
+            visibility_results[query_idx] = final_visible
+            hit_distances[query_idx] = los_hit_distance
+            
+            # 상세 로그 출력
+            los_status = "LOS_OK" if los_visible else "LOS_BLOCKED"
+            frustum_status = "FRUSTUM_OK" if frustum_visible else "FRUSTUM_OUT"
+            final_status = "VISIBLE" if final_visible else "OCCLUDED"
+            
+            print(f"      Query {query_idx + 1}: {final_status} (LOS: {los_status}, Frustum: {frustum_status}, hit: {los_hit_distance:.3f}m) query_point: {query_point}")
+            
+
+
+
+
+            
+        
+        # CustomVisualizerV3가 로봇 메시와 씬 메시를 결합하여 시각화
+        # visualize 함수에 LOS 관련 매개변수 전달 (옵션)
+        # visualizer.visualize(
+        #     color_mesh=combined_mesh, 
+        #     camera_pose=pose_tensor,
+        #     query_points=query_points_3d,  # None이면 LOS 시각화 안함
+        #     visibility_results=visibility_results,  # None이면 LOS 시각화 안함
+        #     camera_intrinsics=K_frame,  # 카메라 내부 파라미터
+        #     image_size=image_size  # 이미지 크기
+        # )
+        
+        # Interactive HTML export를 위한 데이터 저장
+        if export_interactive_html:
+            interactive_meshes.append(combined_mesh)
+            camera_poses_for_export.append(pose_tensor.cpu().numpy())
+        
+        print(f"  Frame {frame_idx + 1} integrated - mesh has {color_mesh.vertices().shape[0]} vertices and {color_mesh.triangles().shape[0]} triangles")
+        print(f"  Process frame time: {time.time() - start:.4f} seconds")
+        
+        
+        
+    print(f'Saving mesh at {save_path}')
+    mapper.update_color_mesh()
+    mapper.get_color_mesh().save(save_path)
+    
+    # Interactive HTML export
+    if export_interactive_html and interactive_meshes:
+        
+        from interactive_3d_exporter import create_custom_threejs_viewer
+        
+        # HTML 파일 경로 생성
+        base_path = save_path.replace('.ply', '')
+        threejs_html_path = f"{base_path}_interactive_threejs.html"
+        
+        # 최종 mesh export (Custom Three.js 방식만 사용)
+        final_mesh = interactive_meshes[-1]  # 마지막 프레임의 mesh
+        
+        # mesh가 비어있는 경우 fallback mesh 생성
+        if len(final_mesh.vertices) == 0 or len(final_mesh.triangles) == 0:
+            print("Warning: Final mesh is empty, creating fallback mesh...")
+            
+            fallback_mesh = o3d.geometry.TriangleMesh.create_box(width=1, height=1, depth=1)
+            fallback_mesh.paint_uniform_color([0.7, 0.1, 0.1])
+            final_mesh = fallback_mesh
+        
+        create_custom_threejs_viewer(
+            final_mesh,
+            threejs_html_path,
+            title="NVBlox Interactive 3D Visualization"
+        )
+        
+        # 카메라 궤적이 있는 경우 추가 정보 표시
+        if len(camera_poses_for_export) > 1:
+            print(f"Camera trajectory data available: {len(camera_poses_for_export)} poses")
+        
+        print(f"Interactive HTML visualization saved: {threejs_html_path}")
+            
 
 
 def create_robot_3d_visualization_plotly_animate_point_cloud(scene_mesh, robot_meshes_list, query_points, viewpoint_matrix, viewdirection_matrix, visibility_results, robot_joint_angles_list, save_path, robot_viz=None, image_size=None, K_adjusted=None, rgb_image=None, depth_image=None):
@@ -2383,45 +2919,7 @@ def create_end_effector_poses_demo(candidate_viewpoints):
 
 
 
-# ========= 메인 =========
-def main():
-    vprint("=== URDF-based Robot Visibility Test with nvblox ===")
-    vprint("Using URDF robot meshes with Inverse Kinematics for realistic robot positioning")
-    
-    # 전체 실행 시간 측정
-    total_start_time = time.time()
-    
-    # 1) 입력 로드
-    vprint("\n=== 1. Loading RGB-D Data ===")
-    load_start_time = time.time()
-    rgb, depth_raw, fake_depth_mask = load_rgbd_from_zarr(BUFFER_PATH, EPISODE_IDX, FRAME_IDX, DEPTH_SCALE)
-    H, W = depth_raw.shape
-    load_end_time = time.time()
-    vprint(f"Loaded RGB: {rgb.shape}, Depth: {depth_raw.shape}")
-    vprint(f"Data loading time: {load_end_time - load_start_time:.4f} seconds")
-
-    # 1.5) 이미지 리사이즈 (옵션) - UniDepth 사용시에는 RGB만 리사이즈
-    if RESIZE:
-        vprint(f"\n=== 1.5. Resizing RGB to {RESIZE_SIZE} ===")
-        resize_start_time = time.time()
-        rgb_resized, _, scale_factor_x, scale_factor_y = resize_image_and_depth(rgb, depth_raw, RESIZE_SIZE)
-        K_adjusted = adjust_camera_intrinsics(K, scale_factor_x, scale_factor_y)
-        resize_end_time = time.time()
-        vprint(f"Resized RGB: {rgb_resized.shape}, Original depth: {depth_raw.shape}")
-        vprint(f"Scale factors: x={scale_factor_x:.4f}, y={scale_factor_y:.4f}")
-        vprint(f"Adjusted camera intrinsics: fx={K_adjusted[0,0]:.2f}, fy={K_adjusted[1,1]:.2f}, cx={K_adjusted[0,2]:.2f}, cy={K_adjusted[1,2]:.2f}")
-        vprint(f"RGB resize time: {resize_end_time - resize_start_time:.4f} seconds")
-    else:
-        K_adjusted = K
-        rgb_resized = rgb
-
-    if K is None:
-        raise ValueError("K (intrinsics)가 None 입니다. 코드 상단의 K를 사용자의 카메라 파라미터로 채워주세요.")
-
-    # 2) Depth 처리
-    vprint("\n=== 2. Depth Processing ===")
-    depth_start_time = time.time()
-    
+def depth_processing(rgb, depth_raw, fake_depth_mask, model, camera):
     if USE_MONODEPTH:
         vprint("Using UniDepth for depth estimation...")
         
@@ -2429,16 +2927,7 @@ def main():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         vprint(f"Using device: {device}")
         
-        name = f"unidepth-v2-vit{MODEL_TYPE}14"
-        model = UniDepthV2.from_pretrained(f"lpiccinelli/{name}")
-        model.interpolation_mode = "bilinear"
-        model = model.to(device).eval()
         
-        # 카메라 설정 (원본 크기로 UniDepth 실행)
-        intrinsics_torch = torch.from_numpy(K).float()
-        camera = Pinhole(K=intrinsics_torch.unsqueeze(0))
-        if isinstance(model, (UniDepthV2old, UniDepthV1)):
-            camera = camera.K.squeeze(0)
         
         # Depth 추정 (원본 크기 RGB 사용)
         vprint(f"Running UniDepth on original RGB: {rgb.shape}")
@@ -2474,499 +2963,612 @@ def main():
         else:
             depth_m = depth_raw
     
-    depth_end_time = time.time()
-    vprint(f"Depth processing time: {depth_end_time - depth_start_time:.4f} seconds")
+    return depth_m
 
-    # 3) 월드 좌표계 = 원 카메라0 좌표계로 가정
-    R0 = np.eye(3, dtype=np.float64)
-    t0 = np.zeros(3, dtype=np.float64)
+# ========= 메인 =========
+def main():
+    vprint("=== URDF-based Robot Visibility Test with nvblox ===")
+    vprint("Using URDF robot meshes with Inverse Kinematics for realistic robot positioning")
+    
+    # 전체 실행 시간 측정
+    total_start_time = time.time()
+    
+    # 1) 입력 로드
+    vprint("\n=== 1. Loading RGB-D Data ===")
+    load_start_time = time.time()
+    rgb_frames, depth_frames, relative_poses, combined_mask, T_mc_transformation, action = load_data_from_zarr(BUFFER_PATH, EPISODE_IDX)
+    rgb, depth_raw, fake_depth_mask, relative_pose, T_mc, act = get_data(rgb_frames, depth_frames, relative_poses, combined_mask, T_mc_transformation, action, FRAME_IDX, DEPTH_SCALE)
+    H, W = depth_raw.shape
+    load_end_time = time.time()
+    vprint(f"Loaded RGB: {rgb.shape}, Depth: {depth_raw.shape}")
+    vprint(f"Data loading time: {load_end_time - load_start_time:.4f} seconds")
 
-    # 4) 쿼리 픽셀 & 3D점
-    vprint(f"\n=== 3. Query Point Selection (N={N_QUERY_POINTS}) ===")
-    query_start_time = time.time()
-    
-    # N개의 쿼리 픽셀 선택
-    query_pixels = pick_query_pixels(depth_m, N=N_QUERY_POINTS)
-    vprint(f"Selected {len(query_pixels)} query pixels: {query_pixels}")
-    
-    # 각 쿼리 픽셀을 3D 월드 좌표로 변환
-    query_points_3d = []
-    fx, fy, cx, cy = K_adjusted[0,0], K_adjusted[1,1], K_adjusted[0,2], K_adjusted[1,2]
-    
-    for i, (uq, vq) in enumerate(query_pixels):
-        dq = float(depth_m[vq, uq])
-        xq = (uq - cx) * dq / fx
-        yq = (vq - cy) * dq / fy
-        Xc0_q = np.array([xq, yq, dq], dtype=np.float64)
-        Xw_q = R0.T @ (Xc0_q - t0)
-        query_points_3d.append(Xw_q)
-        
-        vprint(f"[Query {i+1}] pixel=({uq},{vq}), depth={dq:.4f} m, world_pos={Xw_q}")
-    
-    # 기존 호환성을 위해 첫 번째 쿼리 포인트를 메인 쿼리 포인트로 설정
-    Xw_q = query_points_3d[0]  # 첫 번째 쿼리 포인트
-    uq, vq = query_pixels[0]   # 첫 번째 픽셀 좌표
-
-    query_end_time = time.time()
-    vprint(f"Query point selection time: {query_end_time - query_start_time:.4f} seconds")
-
-    # 5) URDF 기반 로봇 설정 및 nvblox 메시 생성
-    vprint("\n=== 4. URDF-based Robot Setup and nvblox Mesh Generation ===")
-    mesh_start_time = time.time()
-    
-    # URDF 파일 경로 설정
-    urdf_path = "/home/dscho1234/Workspace/unitree_ros/robots/z1_description/xacro/z1.urdf"
-    mesh_base_path = "/home/dscho1234/Workspace/unitree_ros/robots/z1_description/"
-    
-    # Z1 로봇 시각화 객체 생성
-    robot_viz = Z1RobotVisualizer(urdf_path, mesh_base_path)
-    
-    # L개의 end effector pose 생성 (각 column index i에 대응)
-    end_effector_poses = create_end_effector_poses_demo(CANDIDATE_VIEWPOINTS)
-    vprint(f"Generated {len(end_effector_poses)} end effector poses")
-    for i, pose in enumerate(end_effector_poses):
-        vprint(f"  Pose {i+1}: translation={pose[:3, 3]}")
-    
-    # 원본 nvblox 메시 생성 (로봇 없이)
-    vprint("\nCreating original nvblox mesh (without robot)...")
-    original_mesh_start_time = time.time()
-    mesh_original, mapper_original = create_mesh_with_nvblox(depth_m, rgb_resized, K_adjusted, voxel_size=VOXEL_SIZE, max_integration_distance=5.0, return_mapper=True)
-    original_mesh_end_time = time.time()
-    vprint(f"Original nvblox mesh created in {original_mesh_end_time - original_mesh_start_time:.4f} seconds")
-    vprint(f"Original mesh has {mesh_original.vertices().shape[0]} vertices and {mesh_original.triangles().shape[0]} triangles")
-    
-    # L개의 로봇 설정 및 메시 생성 (각 column index i에 대응하는 end effector pose로)
-    robot_meshes_list = []
-    robot_joint_angles_list = []
-    # SDK 비교/시각화는 사용하지 않음
-    
-    for i, end_effector_pose in enumerate(end_effector_poses):
-        vprint(f"\n  Setting up robot {i+1} with end effector pose: translation={end_effector_pose[:3, 3]}")
-        
-        # 홈 포지션으로 초기화
-        robot_viz.set_joint_angles([0, 0, 0, 0, 0, 0])
-
-        # dscho debug
-        gripper_angle = -np.pi/2 # unit : (radian), 0 closed, -1 open (should check the maximum radian values of the robot)
-        
-        # Inverse Kinematics로 조인트 각도 계산
-        ik_success = robot_viz.solve_inverse_kinematics(end_effector_pose, gripper_angle=gripper_angle)
-        
-        if ik_success:
-            # Forward Kinematics 비교 (첫 번째 로봇에 대해서만)
-            # 디버그 비교 호출 제거
-            
-            # 로봇의 모든 링크 메시를 월드 좌표계로 변환하여 가져오기
-            robot_meshes = robot_viz.get_robot_meshes_in_specified_transform(gripper_angle=gripper_angle)
-            robot_meshes_list.append(robot_meshes)
-            robot_joint_angles_list.append(robot_viz.joint_angles.copy())
-            
-            vprint(f"  Robot {i+1} setup successful: {len(robot_meshes)} links")
-            for link_name, mesh in robot_meshes.items():
-                if mesh is not None and len(mesh.vertices) > 0:
-                    vprint(f"    {link_name}: {len(mesh.vertices)} vertices")
-        else:
-            vprint(f"  Robot {i+1} setup failed: Inverse Kinematics failed")
-            robot_meshes_list.append({})
-            robot_joint_angles_list.append(np.zeros(6))
-    
-    mesh_end_time = time.time()
-    vprint(f"\nAll robot setups completed in {mesh_end_time - mesh_start_time:.4f} seconds")
-    
-    # 6) M개의 viewpoint set에 대해 각 robot별로 visibility 체크
-    vprint("\n=== 5. URDF-based Robot Visibility Check ===")
-    visibility_start_time = time.time()
-    
-    # 카메라 파라미터를 한 번만 계산 (성능 최적화)
-    vprint("\nCalculating camera parameters...")
+    # 1.5) 이미지 리사이즈 (옵션) - UniDepth 사용시에는 RGB만 리사이즈
     if RESIZE:
-        image_size = RESIZE_SIZE
+        vprint(f"\n=== 1.5. Resizing RGB to {RESIZE_SIZE} ===")
+        resize_start_time = time.time()
+        rgb_resized, _, scale_factor_x, scale_factor_y = resize_image_and_depth(rgb, depth_raw, RESIZE_SIZE)
+        K_adjusted = adjust_camera_intrinsics(K, scale_factor_x, scale_factor_y)
+        resize_end_time = time.time()
+        vprint(f"Resized RGB: {rgb_resized.shape}, Original depth: {depth_raw.shape}")
+        vprint(f"Scale factors: x={scale_factor_x:.4f}, y={scale_factor_y:.4f}")
+        vprint(f"Adjusted camera intrinsics: fx={K_adjusted[0,0]:.2f}, fy={K_adjusted[1,1]:.2f}, cx={K_adjusted[0,2]:.2f}, cy={K_adjusted[1,2]:.2f}")
+        vprint(f"RGB resize time: {resize_end_time - resize_start_time:.4f} seconds")
     else:
-        image_size = IMAGE_SIZE
-    
-    
-    vprint(f"Processing {M} viewpoint sets, each with {L} viewpoints...")
-    vprint(f"Total viewpoints to check: {M} x {L} = {M*L}")
-    
-    # [M, L, N] 모양의 visibility 결과 저장 (N개의 쿼리 포인트에 대해)
-    visibility_results = np.zeros((M, L, N_QUERY_POINTS), dtype=bool)  # True if visible, False if occluded
-    hit_distances = np.zeros((M, L, N_QUERY_POINTS), dtype=np.float64)  # Hit distances for each viewpoint and query point
-    
-    # 각 robot별로 RaycastingScene을 미리 생성 (성능 최적화)
-    vprint(f"\n=== Pre-creating RaycastingScenes for {L} robots ===")
-    scene_creation_start_time = time.time()
-    raycasting_scenes = []
-    
-    for robot_idx in range(L):
-        vprint(f"  Creating scene for robot {robot_idx + 1}...")
-        if robot_idx < len(robot_meshes_list) and len(robot_meshes_list[robot_idx]) > 0:
-            # Scene mesh와 robot meshes를 결합한 scene 생성
-            scene = create_combined_scene_with_robot(mesh_original, robot_meshes_list[robot_idx])
+        K_adjusted = K
+        rgb_resized = rgb
+
+    if K is None:
+        raise ValueError("K (intrinsics)가 None 입니다. 코드 상단의 K를 사용자의 카메라 파라미터로 채워주세요.")
+    if USE_MONODEPTH:
+        name = f"unidepth-v2-vit{MODEL_TYPE}14"
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = UniDepthV2.from_pretrained(f"lpiccinelli/{name}")
+        model.interpolation_mode = "bilinear"
+        model = model.to(device).eval()
+        
+        # 카메라 설정 (원본 크기로 UniDepth 실행)
+        intrinsics_torch = torch.from_numpy(K).float()
+        camera = Pinhole(K=intrinsics_torch.unsqueeze(0))
+    else:
+        model = None
+        camera = None
+
+    if isinstance(model, (UniDepthV2old, UniDepthV1)):
+        camera = camera.K.squeeze(0)
+    if not DEBUG:
+        # 2) Depth 처리
+        vprint("\n=== 2. Depth Processing ===")
+        depth_start_time = time.time()
+        depth_m = depth_processing(rgb, depth_raw, fake_depth_mask, model, camera)
+        
+        depth_end_time = time.time()
+        vprint(f"Depth processing time: {depth_end_time - depth_start_time:.4f} seconds")
+
+        # 3) 월드 좌표계 = 원 카메라0 좌표계로 가정
+        R0 = np.eye(3, dtype=np.float64)
+        t0 = np.zeros(3, dtype=np.float64)
+
+        # 4) 쿼리 픽셀 & 3D점
+        vprint(f"\n=== 3. Query Point Selection (N={N_QUERY_POINTS}) ===")
+        query_start_time = time.time()
+        
+        # N개의 쿼리 픽셀 선택
+        query_pixels = pick_query_pixels(depth_m, N=N_QUERY_POINTS)
+        vprint(f"Selected {len(query_pixels)} query pixels: {query_pixels}")
+        
+        # 각 쿼리 픽셀을 3D 월드 좌표로 변환
+        query_points_3d = []
+        fx, fy, cx, cy = K_adjusted[0,0], K_adjusted[1,1], K_adjusted[0,2], K_adjusted[1,2]
+        
+        for i, (uq, vq) in enumerate(query_pixels):
+            dq = float(depth_m[vq, uq])
+            xq = (uq - cx) * dq / fx
+            yq = (vq - cy) * dq / fy
+            Xc0_q = np.array([xq, yq, dq], dtype=np.float64)
+            Xw_q = R0.T @ (Xc0_q - t0)
+            query_points_3d.append(Xw_q)
+            
+            vprint(f"[Query {i+1}] pixel=({uq},{vq}), depth={dq:.4f} m, world_pos={Xw_q}")
+        
+        # 기존 호환성을 위해 첫 번째 쿼리 포인트를 메인 쿼리 포인트로 설정
+        Xw_q = query_points_3d[0]  # 첫 번째 쿼리 포인트
+        uq, vq = query_pixels[0]   # 첫 번째 픽셀 좌표
+
+        query_end_time = time.time()
+        vprint(f"Query point selection time: {query_end_time - query_start_time:.4f} seconds")
+        
+        # 5) URDF 기반 로봇 설정 및 nvblox 메시 생성
+        vprint("\n=== 4. URDF-based Robot Setup and nvblox Mesh Generation ===")
+        mesh_start_time = time.time()
+        
+        # URDF 파일 경로 설정
+        urdf_path = "/home/dscho1234/Workspace/unitree_ros/robots/z1_description/xacro/z1.urdf"
+        mesh_base_path = "/home/dscho1234/Workspace/unitree_ros/robots/z1_description/"
+        
+        # Z1 로봇 시각화 객체 생성
+        robot_viz = Z1RobotVisualizer(urdf_path, mesh_base_path)
+        
+        # L개의 end effector pose 생성 (각 column index i에 대응)
+        end_effector_poses = create_end_effector_poses_demo(CANDIDATE_VIEWPOINTS)
+        vprint(f"Generated {len(end_effector_poses)} end effector poses")
+        for i, pose in enumerate(end_effector_poses):
+            vprint(f"  Pose {i+1}: translation={pose[:3, 3]}")
+        
+        # 원본 nvblox 메시 생성 (로봇 없이)
+        vprint("\nCreating original nvblox mesh (without robot)...")
+        original_mesh_start_time = time.time()
+        # Identity pose for original mesh
+        identity_pose = np.eye(4)
+        mesh_original, mapper_original = create_mesh_with_nvblox(depth_m, rgb_resized, K_adjusted, identity_pose, voxel_size=VOXEL_SIZE, max_integration_distance=5.0, return_mapper=True)
+        original_mesh_end_time = time.time()
+        vprint(f"Original nvblox mesh created in {original_mesh_end_time - original_mesh_start_time:.4f} seconds")
+        vprint(f"Original mesh has {mesh_original.vertices().shape[0]} vertices and {mesh_original.triangles().shape[0]} triangles")
+        
+        # L개의 로봇 설정 및 메시 생성 (각 column index i에 대응하는 end effector pose로)
+        robot_meshes_list = []
+        robot_joint_angles_list = []
+        # SDK 비교/시각화는 사용하지 않음
+        
+        for i, end_effector_pose in enumerate(end_effector_poses):
+            vprint(f"\n  Setting up robot {i+1} with end effector pose: translation={end_effector_pose[:3, 3]}")
+            
+            # 홈 포지션으로 초기화
+            robot_viz.set_joint_angles([0, 0, 0, 0, 0, 0])
+
+            # dscho debug
+            gripper_angle = -np.pi/2 # unit : (radian), 0 closed, -1 open (should check the maximum radian values of the robot)
+            
+            # Inverse Kinematics로 조인트 각도 계산
+            ik_success = robot_viz.solve_inverse_kinematics(end_effector_pose, gripper_angle=gripper_angle)
+            
+            if ik_success:
+                # Forward Kinematics 비교 (첫 번째 로봇에 대해서만)
+                
+                # 로봇의 모든 링크 메시를 월드 좌표계로 변환하여 가져오기
+                start = time.time()
+                robot_meshes = robot_viz.get_robot_meshes_in_specified_transform(gripper_angle=gripper_angle)
+                print(f"  @@@@@ for debug, Robot meshes time: {time.time() - start:.4f} seconds")
+                time.sleep(1)
+                robot_meshes_list.append(robot_meshes)
+                robot_joint_angles_list.append(robot_viz.joint_angles.copy())
+                
+                vprint(f"  Robot {i+1} setup successful: {len(robot_meshes)} links")
+                for link_name, mesh in robot_meshes.items():
+                    if mesh is not None and len(mesh.vertices) > 0:
+                        vprint(f"    {link_name}: {len(mesh.vertices)} vertices")
+            else:
+                vprint(f"  Robot {i+1} setup failed: Inverse Kinematics failed")
+                robot_meshes_list.append({})
+                robot_joint_angles_list.append(np.zeros(6))
+        
+        mesh_end_time = time.time()
+        vprint(f"\nAll robot setups completed in {mesh_end_time - mesh_start_time:.4f} seconds")
+        
+        # 6) M개의 viewpoint set에 대해 각 robot별로 visibility 체크
+        vprint("\n=== 5. URDF-based Robot Visibility Check ===")
+        visibility_start_time = time.time()
+        
+        # 카메라 파라미터를 한 번만 계산 (성능 최적화)
+        vprint("\nCalculating camera parameters...")
+        if RESIZE:
+            image_size = RESIZE_SIZE
         else:
-            # Robot이 없는 경우 원본 scene만 사용
-            scene = create_raycasting_scene(mesh_original)
-        raycasting_scenes.append(scene)
-    
-    scene_creation_end_time = time.time()
-    vprint(f"All RaycastingScenes created in {scene_creation_end_time - scene_creation_start_time:.4f} seconds")
-    
-    # 각 robot별로 (L개의 robot) visibility 체크
-    for robot_idx in range(L):  # robot_idx는 column index i에 해당
-        vprint(f"\n=== Checking robot {robot_idx + 1} (column {robot_idx}) ===")
-        current_scene = raycasting_scenes[robot_idx]
+            image_size = IMAGE_SIZE
         
-        # 현재 robot_idx에 해당하는 column의 viewpoints들을 모음: CANDIDATE_VIEWPOINTS_MATRIX[:, robot_idx]
-        viewpoints_for_this_robot = CANDIDATE_VIEWPOINTS_MATRIX[:, robot_idx]  # [M, 3] 모양
-        viewdirections_for_this_robot = CANDIDATE_ROTATIONS_MATRIX[:, robot_idx]  # [M, 3] 모양
-        vprint(f"  Viewpoints for this robot: {viewpoints_for_this_robot.shape} (M viewpoints)")
         
-        # Batch raycasting 방식 (미리 생성된 scene 사용)
-        vprint(f"  Performing batch raycasting for {M} viewpoints...")
+        vprint(f"Processing {M} viewpoint sets, each with {L} viewpoints...")
+        vprint(f"Total viewpoints to check: {M} x {L} = {M*L}")
         
-        # 각 viewpoint에 대해 N개의 쿼리 포인트에 대한 LOS 체크와 카메라 frustum 체크 수행
-        for set_idx in range(M):
-            viewpoint = viewpoints_for_this_robot[set_idx]
-            viewdirection = viewdirections_for_this_robot[set_idx]  # [roll, pitch, yaw] in degrees
-            
-            vprint(f"    Set {set_idx + 1}: {viewpoint}")
-            
-            # N개의 쿼리 포인트에 대해 visibility 체크
-            for query_idx in range(N_QUERY_POINTS):
-                query_point = query_points_3d[query_idx]
-                
-                # 1. LOS 체크 (기존 raycasting)
-                direction = query_point - viewpoint
-                distance = np.linalg.norm(direction)
-                direction_normalized = direction / distance
-                
-                # 단일 ray에 대한 raycasting
-                origins_single = viewpoint.reshape(1, 3)
-                directions_single = direction_normalized.reshape(1, 3)
-                distances_single = np.array([distance - OFFSET_DISTANCE])
-                
-                los_visible, los_hit_distances = batch_raycasting_with_scene(
-                    current_scene, origins_single, directions_single, distances_single
-                )
-                los_visible = los_visible[0]
-                los_hit_distance = los_hit_distances[0]
-                
-                # 2. 카메라 frustum 체크
-                # 미리 계산된 카메라 파라미터 사용
-                frustum_visible = is_point_in_camera_frustum(
-                    query_point, viewpoint, viewdirection, K_adjusted, image_size
-                )
-                
-                # 3. 최종 visibility: LOS 체크와 frustum 체크를 모두 통과해야 함
-                final_visible = los_visible and frustum_visible
-                
-                # 결과 저장
-                visibility_results[set_idx, robot_idx, query_idx] = final_visible
-                hit_distances[set_idx, robot_idx, query_idx] = los_hit_distance
-                
-                # 상세 로그 출력
-                los_status = "LOS_OK" if los_visible else "LOS_BLOCKED"
-                frustum_status = "FRUSTUM_OK" if frustum_visible else "FRUSTUM_OUT"
-                final_status = "VISIBLE" if final_visible else "OCCLUDED"
-                
-                vprint(f"      Query {query_idx + 1}: {final_status} (LOS: {los_status}, Frustum: {frustum_status}, hit: {los_hit_distance:.3f}m)")
-            
-    
-    visibility_end_time = time.time()
-    vprint(f"\nURDF-based robot visibility check time: {visibility_end_time - visibility_start_time:.4f} seconds")
-    
-    # 7) Reward 계산 (visible=1, occluded=0)
-    vprint(f"\n=== 6. Reward Calculation (N={N_QUERY_POINTS} query points) ===")
-    reward_start_time = time.time()
-    
-    # [M, L, N] 모양의 reward 매트릭스 생성 (visible=1, occluded=0)
-    reward_matrix = visibility_results.astype(np.float64)
-    
-    vprint("Reward matrix (M x L x N):")
-    vprint("  M = viewpoint set index (row)")
-    vprint("  L = viewpoint index (column)")
-    vprint("  N = query point index (depth)")
-    vprint("  Value: 1.0 = visible, 0.0 = occluded")
-    vprint("")
-    
-    # 각 viewpoint set별로 reward 출력
-    for set_idx in range(M):
-        vprint(f"Viewpoint set {set_idx + 1}:")
+        # [M, L, N] 모양의 visibility 결과 저장 (N개의 쿼리 포인트에 대해)
+        visibility_results = np.zeros((M, L, N_QUERY_POINTS), dtype=bool)  # True if visible, False if occluded
+        hit_distances = np.zeros((M, L, N_QUERY_POINTS), dtype=np.float64)  # Hit distances for each viewpoint and query point
+        
+        # 각 robot별로 RaycastingScene을 미리 생성 (성능 최적화)
+        vprint(f"\n=== Pre-creating RaycastingScenes for {L} robots ===")
+        scene_creation_start_time = time.time()
+        raycasting_scenes = []
+        
         for robot_idx in range(L):
-            query_rewards = reward_matrix[set_idx, robot_idx, :]
-            vprint(f"  Robot {robot_idx + 1}: {query_rewards} (sum: {np.sum(query_rewards):.1f})")
-    
-    # 각 viewpoint set별로 최종 reward 계산 (L개의 viewpoint x N개의 query point에 따른 reward 합계)
-    final_rewards = np.sum(reward_matrix, axis=(1, 2))  # [M] 모양의 배열 (L x N 합계)
-    vprint(f"\nFinal rewards for each viewpoint set:")
-    for set_idx in range(M):
-        vprint(f"  Set {set_idx + 1}: {final_rewards[set_idx]:.1f} (sum of {L} viewpoints x {N_QUERY_POINTS} query points)")
-    
-    vprint(f"\nFinal rewards array: {final_rewards}")
-    vprint(f"Total reward sum: {np.sum(final_rewards):.1f}")
-    
-    # 각 쿼리 포인트별 통계
-    vprint(f"\nQuery point statistics:")
-    for query_idx in range(N_QUERY_POINTS):
-        query_visibility = visibility_results[:, :, query_idx]
-        total_visible = np.sum(query_visibility)
-        total_possible = M * L
-        visibility_rate = total_visible / total_possible * 100
-        vprint(f"  Query {query_idx + 1}: {total_visible}/{total_possible} visible ({visibility_rate:.1f}%)")
-    
-    reward_end_time = time.time()
-    vprint(f"Reward calculation time: {reward_end_time - reward_start_time:.4f} seconds")
-    
-    # 결과 정리 (기존 코드와 호환성을 위해)
-    results = []
-    for i, (viewpoint, viewdirection) in enumerate(zip(CANDIDATE_VIEWPOINTS, CANDIDATE_ROTATIONS)):
-        # 첫 번째 viewpoint set의 결과를 사용 (기존 시각화 코드와 호환)
-        # 첫 번째 쿼리 포인트의 결과를 사용 (기존 시각화 코드와 호환)
-        visible_robot = visibility_results[0, i, 0] if i < L else False
-        hit_distance_robot = hit_distances[0, i, 0] if i < L else 0.0
+            vprint(f"  Creating scene for robot {robot_idx + 1}...")
+            if robot_idx < len(robot_meshes_list) and len(robot_meshes_list[robot_idx]) > 0:
+                # Scene mesh와 robot meshes를 결합한 scene 생성
+                scene = create_combined_scene_with_robot(mesh_original, robot_meshes_list[robot_idx])
+            else:
+                # Robot이 없는 경우 원본 scene만 사용
+                scene = create_raycasting_scene(mesh_original)
+            raycasting_scenes.append(scene)
         
-        # 각 viewpoint에서 첫 번째 query point까지의 거리 계산
-        distance_to_query = np.linalg.norm(Xw_q - viewpoint)
+        scene_creation_end_time = time.time()
+        vprint(f"All RaycastingScenes created in {scene_creation_end_time - scene_creation_start_time:.4f} seconds")
         
-        result = {
-            'viewpoint': viewpoint,
-            'viewdirection': viewdirection,  # [roll, pitch, yaw] in degrees
-            'visible_robot': visible_robot,
-            'visible_original': visible_robot,  # 호환성을 위해 동일하게 설정
-            'hit_distance_robot': hit_distance_robot,
-            'hit_distance_original': hit_distance_robot,  # 호환성을 위해 동일하게 설정
-            'distance_to_query': distance_to_query
-        }
-        results.append(result)
-    
-    # 결과 출력
-    vprint("\n=== Visibility Check Results ===")
-    for i, result in enumerate(results):
-        vprint(f"\nViewpoint {i+1}: {result['viewpoint']}, rotation={result['viewdirection']}°")
-        # result['visible_robot']이 배열인 경우 첫 번째 요소 사용
-        visible_robot = result['visible_robot']
-        visible_original = result['visible_original']
+        # 각 robot별로 (L개의 robot) visibility 체크
+        for robot_idx in range(L):  # robot_idx는 column index i에 해당
+            vprint(f"\n=== Checking robot {robot_idx + 1} (column {robot_idx}) ===")
+            current_scene = raycasting_scenes[robot_idx]
+            
+            # 현재 robot_idx에 해당하는 column의 viewpoints들을 모음: CANDIDATE_VIEWPOINTS_MATRIX[:, robot_idx]
+            viewpoints_for_this_robot = CANDIDATE_VIEWPOINTS_MATRIX[:, robot_idx]  # [M, 3] 모양
+            viewdirections_for_this_robot = CANDIDATE_ROTATIONS_MATRIX[:, robot_idx]  # [M, 3] 모양
+            vprint(f"  Viewpoints for this robot: {viewpoints_for_this_robot.shape} (M viewpoints)")
+            
+            # Batch raycasting 방식 (미리 생성된 scene 사용)
+            vprint(f"  Performing batch raycasting for {M} viewpoints...")
+            
+            # 각 viewpoint에 대해 N개의 쿼리 포인트에 대한 LOS 체크와 카메라 frustum 체크 수행
+            for set_idx in range(M):
+                viewpoint = viewpoints_for_this_robot[set_idx]
+                viewdirection = viewdirections_for_this_robot[set_idx]  # [roll, pitch, yaw] in degrees
+                
+                vprint(f"    Set {set_idx + 1}: {viewpoint}")
+                
+                # N개의 쿼리 포인트에 대해 visibility 체크
+                for query_idx in range(N_QUERY_POINTS):
+                    query_point = query_points_3d[query_idx]
+                    
+                    # 1. LOS 체크 (기존 raycasting)
+                    direction = query_point - viewpoint
+                    distance = np.linalg.norm(direction)
+                    direction_normalized = direction / distance
+                    
+                    # 단일 ray에 대한 raycasting
+                    origins_single = viewpoint.reshape(1, 3)
+                    directions_single = direction_normalized.reshape(1, 3)
+                    distances_single = np.array([distance - OFFSET_DISTANCE])
+                    
+                    los_visible, los_hit_distances = batch_raycasting_with_scene(
+                        current_scene, origins_single, directions_single, distances_single
+                    )
+                    los_visible = los_visible[0]
+                    los_hit_distance = los_hit_distances[0]
+                    
+                    # 2. 카메라 frustum 체크
+                    # 미리 계산된 카메라 파라미터 사용
+                    frustum_visible = is_point_in_camera_frustum(
+                        query_point, viewpoint, viewdirection, K_adjusted, image_size
+                    )
+                    
+                    # 3. 최종 visibility: LOS 체크와 frustum 체크를 모두 통과해야 함
+                    final_visible = los_visible and frustum_visible
+                    
+                    # 결과 저장
+                    visibility_results[set_idx, robot_idx, query_idx] = final_visible
+                    hit_distances[set_idx, robot_idx, query_idx] = los_hit_distance
+                    
+                    # 상세 로그 출력
+                    los_status = "LOS_OK" if los_visible else "LOS_BLOCKED"
+                    frustum_status = "FRUSTUM_OK" if frustum_visible else "FRUSTUM_OUT"
+                    final_status = "VISIBLE" if final_visible else "OCCLUDED"
+                    
+                    vprint(f"      Query {query_idx + 1}: {final_status} (LOS: {los_status}, Frustum: {frustum_status}, hit: {los_hit_distance:.3f}m)")
+                
         
-        # numpy 배열인 경우 첫 번째 요소 추출
-        if hasattr(visible_robot, '__len__') and not isinstance(visible_robot, (str, bool)):
-            visible_robot = visible_robot[0]
-        if hasattr(visible_original, '__len__') and not isinstance(visible_original, (str, bool)):
-            visible_original = visible_original[0]
+        visibility_end_time = time.time()
+        vprint(f"\nURDF-based robot visibility check time: {visibility_end_time - visibility_start_time:.4f} seconds")
         
-        vprint(f"  Robot-transformed mesh: {'✓ VISIBLE' if visible_robot else '✗ OCCLUDED'} (hit_distance: {result['hit_distance_robot']:.3f}m)")
-        vprint(f"  Original mesh: {'✓ VISIBLE' if visible_original else '✗ OCCLUDED'} (hit_distance: {result['hit_distance_original']:.3f}m)")
+        # 7) Reward 계산 (visible=1, occluded=0)
+        vprint(f"\n=== 6. Reward Calculation (N={N_QUERY_POINTS} query points) ===")
+        reward_start_time = time.time()
         
-        # 로봇 변환 효과 분석
-        if visible_original != visible_robot:
-            vprint(f"  🔄 Robot transformation changed visibility: {'✓ VISIBLE' if visible_original else '✗ OCCLUDED'} → {'✓ VISIBLE' if visible_robot else '✗ OCCLUDED'}")
-        if abs(result['hit_distance_original'] - result['hit_distance_robot']) > 0.01:
-            vprint(f"  📏 Hit distance changed: {result['hit_distance_original']:.3f}m → {result['hit_distance_robot']:.3f}m")
-
-    # 8) 시각화
-    vprint("\n=== 7. Creating Visualizations ===")
-    viz_start_time = time.time()
-    
-    import os
-    os.makedirs("visibility_test_output", exist_ok=True)
-    
-    # 2D 시각화 (URDF 기반 로봇 정보 포함)
-    fig, ax = plt.subplots(2, 2, figsize=(15, 10))
-    
-    # RGB with Query Points
-    ax[0,0].imshow(rgb_resized)
-    colors = ['cyan', 'red', 'green', 'yellow', 'magenta', 'orange', 'purple', 'brown']
-    for i, (uq, vq) in enumerate(query_pixels):
-        color = colors[i % len(colors)]
-        label = f'Query Point {i+1}' if N_QUERY_POINTS > 1 else 'Query Point'
-        ax[0,0].scatter([uq], [vq], c=color, s=40, marker='x', label=label)
-    ax[0,0].set_title(f'RGB with {N_QUERY_POINTS} Query Points')
-    ax[0,0].axis('off')
-    ax[0,0].legend()
-    
-    # Depth with Query Points
-    im = ax[0,1].imshow(depth_m, cmap='magma')
-    for i, (uq, vq) in enumerate(query_pixels):
-        color = colors[i % len(colors)]
-        label = f'Query Point {i+1}' if N_QUERY_POINTS > 1 else 'Query Point'
-        ax[0,1].scatter([uq], [vq], c=color, s=40, marker='x', label=label)
-    ax[0,1].set_title('Depth (m)')
-    ax[0,1].axis('off')
-    ax[0,1].legend()
-    fig.colorbar(im, ax=ax[0,1], shrink=0.7, label='meters')
-    
-    # Robot Joint Angles 정보
-    ax[1,0].text(0.1, 0.9, 'Robot Joint Angles:', transform=ax[1,0].transAxes, fontsize=12, fontweight='bold')
-    for i, joint_angles in enumerate(robot_joint_angles_list):
-        if len(joint_angles) > 0:
-            ax[1,0].text(0.1, 0.8 - i*0.1, f'Robot {i+1}: {joint_angles}', 
-                        transform=ax[1,0].transAxes, fontsize=10)
-    ax[1,0].set_title('Robot Joint Angles')
-    ax[1,0].axis('off')
-    
-    # End Effector Poses 정보
-    ax[1,1].text(0.1, 0.9, 'End Effector Poses:', transform=ax[1,1].transAxes, fontsize=12, fontweight='bold')
-    for i, pose in enumerate(end_effector_poses):
-        translation = pose[:3, 3]
-        ax[1,1].text(0.1, 0.8 - i*0.1, f'Pose {i+1}: [{translation[0]:.3f}, {translation[1]:.3f}, {translation[2]:.3f}]', 
-                    transform=ax[1,1].transAxes, fontsize=10)
-    ax[1,1].set_title('End Effector Poses')
-    ax[1,1].axis('off')
-    
-    plt.tight_layout()
-    plt.savefig("visibility_test_output/rgb_depth_query_with_robot_info.png", dpi=150, bbox_inches='tight')
-    plt.close()
-    vprint("2D visualization with robot info saved to: visibility_test_output/rgb_depth_query_with_robot_info.png")
-    
-    # Reward 매트릭스 시각화 (N개의 쿼리 포인트에 대해)
-    fig, ax = plt.subplots(1, 2, figsize=(15, 6))
-    
-    # Reward 매트릭스 히트맵 (M x L x N를 M x L로 평균화)
-    reward_matrix_2d = np.mean(reward_matrix, axis=2)  # N개 쿼리 포인트의 평균
-    im1 = ax[0].imshow(reward_matrix_2d, cmap='RdYlGn', vmin=0, vmax=1, aspect='auto')
-    ax[0].set_title(f'Reward Matrix (M x L) - Average of {N_QUERY_POINTS} Query Points\nGreen=Visible(1), Red=Occluded(0)')
-    ax[0].set_xlabel('Viewpoint Index (L)')
-    ax[0].set_ylabel('Viewpoint Set Index (M)')
-    
-    # 컬러바 추가
-    cbar1 = plt.colorbar(im1, ax=ax[0], shrink=0.8)
-    cbar1.set_label('Average Reward (1.0=Visible, 0.0=Occluded)')
-    
-    # 각 셀에 값 표시
-    for i in range(M):
-        for j in range(L):
-            text = ax[0].text(j, i, f'{reward_matrix_2d[i, j]:.2f}',
-                            ha="center", va="center", color="black", fontweight='bold')
-    
-    # 최종 reward 막대 그래프
-    bars = ax[1].bar(range(1, M+1), final_rewards, color=['skyblue', 'lightgreen', 'lightcoral'][:M])
-    ax[1].set_title('Final Rewards per Viewpoint Set')
-    ax[1].set_xlabel('Viewpoint Set Index (M)')
-    ax[1].set_ylabel('Total Reward')
-    ax[1].set_ylim(0, L + 0.5)
-    
-    # 각 막대 위에 값 표시
-    for i, reward in enumerate(final_rewards):
-        ax[1].text(i+1, reward + 0.1, f'{reward:.1f}', ha='center', va='bottom', fontweight='bold')
-    
-    plt.tight_layout()
-    plt.savefig("visibility_test_output/reward_analysis.png", dpi=150, bbox_inches='tight')
-    plt.close()
-    vprint("Reward analysis visualization saved to: visibility_test_output/reward_analysis.png")
-
-    # 3D 시각화 - 각 robot별로 독립적인 시각화 생성
-    vprint("Creating individual 3D visualizations for each robot...")
-    
-    # 각 robot별로 시각화 생성
-    for robot_idx in range(L):
-        vprint(f"Creating visualization for robot {robot_idx + 1}...")
+        # [M, L, N] 모양의 reward 매트릭스 생성 (visible=1, occluded=0)
+        reward_matrix = visibility_results.astype(np.float64)
         
-        # 현재 robot과 관련 데이터
-        current_robot_meshes = robot_meshes_list[robot_idx] if robot_idx < len(robot_meshes_list) else {}
-        current_joint_angles = robot_joint_angles_list[robot_idx] if robot_idx < len(robot_joint_angles_list) else np.zeros(6)
+        vprint("Reward matrix (M x L x N):")
+        vprint("  M = viewpoint set index (row)")
+        vprint("  L = viewpoint index (column)")
+        vprint("  N = query point index (depth)")
+        vprint("  Value: 1.0 = visible, 0.0 = occluded")
+        vprint("")
         
-        # 현재 robot에 대한 visibility 결과만 추출 (모든 viewpoint set에서)
-        current_robot_results = []
+        # 각 viewpoint set별로 reward 출력
         for set_idx in range(M):
-            visible = visibility_results[set_idx, robot_idx]
-            hit_distance = hit_distances[set_idx, robot_idx]
-            viewpoint = CANDIDATE_VIEWPOINTS_MATRIX[set_idx, robot_idx]
-            viewdirection = CANDIDATE_ROTATIONS_MATRIX[set_idx, robot_idx]
-            # 각 viewpoint에서 query point까지의 거리 계산
+            vprint(f"Viewpoint set {set_idx + 1}:")
+            for robot_idx in range(L):
+                query_rewards = reward_matrix[set_idx, robot_idx, :]
+                vprint(f"  Robot {robot_idx + 1}: {query_rewards} (sum: {np.sum(query_rewards):.1f})")
+        
+        # 각 viewpoint set별로 최종 reward 계산 (L개의 viewpoint x N개의 query point에 따른 reward 합계)
+        final_rewards = np.sum(reward_matrix, axis=(1, 2))  # [M] 모양의 배열 (L x N 합계)
+        vprint(f"\nFinal rewards for each viewpoint set:")
+        for set_idx in range(M):
+            vprint(f"  Set {set_idx + 1}: {final_rewards[set_idx]:.1f} (sum of {L} viewpoints x {N_QUERY_POINTS} query points)")
+        
+        vprint(f"\nFinal rewards array: {final_rewards}")
+        vprint(f"Total reward sum: {np.sum(final_rewards):.1f}")
+        
+        # 각 쿼리 포인트별 통계
+        vprint(f"\nQuery point statistics:")
+        for query_idx in range(N_QUERY_POINTS):
+            query_visibility = visibility_results[:, :, query_idx]
+            total_visible = np.sum(query_visibility)
+            total_possible = M * L
+            visibility_rate = total_visible / total_possible * 100
+            vprint(f"  Query {query_idx + 1}: {total_visible}/{total_possible} visible ({visibility_rate:.1f}%)")
+        
+        reward_end_time = time.time()
+        vprint(f"Reward calculation time: {reward_end_time - reward_start_time:.4f} seconds")
+        
+        # 결과 정리 (기존 코드와 호환성을 위해)
+        results = []
+        for i, (viewpoint, viewdirection) in enumerate(zip(CANDIDATE_VIEWPOINTS, CANDIDATE_ROTATIONS)):
+            # 첫 번째 viewpoint set의 결과를 사용 (기존 시각화 코드와 호환)
+            # 첫 번째 쿼리 포인트의 결과를 사용 (기존 시각화 코드와 호환)
+            visible_robot = visibility_results[0, i, 0] if i < L else False
+            hit_distance_robot = hit_distances[0, i, 0] if i < L else 0.0
+            
+            # 각 viewpoint에서 첫 번째 query point까지의 거리 계산
             distance_to_query = np.linalg.norm(Xw_q - viewpoint)
             
             result = {
                 'viewpoint': viewpoint,
-                'visible_robot': visible,
-                'visible_original': visible,  # 호환성을 위해 동일하게 설정
-                'hit_distance_robot': hit_distance,
-                'hit_distance_original': hit_distance,  # 호환성을 위해 동일하게 설정
+                'viewdirection': viewdirection,  # [roll, pitch, yaw] in degrees
+                'visible_robot': visible_robot,
+                'visible_original': visible_robot,  # 호환성을 위해 동일하게 설정
+                'hit_distance_robot': hit_distance_robot,
+                'hit_distance_original': hit_distance_robot,  # 호환성을 위해 동일하게 설정
                 'distance_to_query': distance_to_query
             }
-            current_robot_results.append(result)
+            results.append(result)
         
-        # 현재 robot에 대한 시각화 생성 (robot meshes와 scene mesh 결합)
-        create_robot_3d_visualization_plotly(
-            mesh_original, current_robot_meshes, query_points_3d, CANDIDATE_VIEWPOINTS_MATRIX[:, robot_idx], CANDIDATE_ROTATIONS_MATRIX[:, robot_idx], 
-            current_robot_results, current_joint_angles,
-            f"visibility_test_output/3d_visualization_robot_{robot_idx + 1}.html",
+        # 결과 출력
+        vprint("\n=== Visibility Check Results ===")
+        for i, result in enumerate(results):
+            vprint(f"\nViewpoint {i+1}: {result['viewpoint']}, rotation={result['viewdirection']}°")
+            # result['visible_robot']이 배열인 경우 첫 번째 요소 사용
+            visible_robot = result['visible_robot']
+            visible_original = result['visible_original']
+            
+            # numpy 배열인 경우 첫 번째 요소 추출
+            if hasattr(visible_robot, '__len__') and not isinstance(visible_robot, (str, bool)):
+                visible_robot = visible_robot[0]
+            if hasattr(visible_original, '__len__') and not isinstance(visible_original, (str, bool)):
+                visible_original = visible_original[0]
+            
+            vprint(f"  Robot-transformed mesh: {'✓ VISIBLE' if visible_robot else '✗ OCCLUDED'} (hit_distance: {result['hit_distance_robot']:.3f}m)")
+            vprint(f"  Original mesh: {'✓ VISIBLE' if visible_original else '✗ OCCLUDED'} (hit_distance: {result['hit_distance_original']:.3f}m)")
+            
+            # 로봇 변환 효과 분석
+            if visible_original != visible_robot:
+                vprint(f"  🔄 Robot transformation changed visibility: {'✓ VISIBLE' if visible_original else '✗ OCCLUDED'} → {'✓ VISIBLE' if visible_robot else '✗ OCCLUDED'}")
+            if abs(result['hit_distance_original'] - result['hit_distance_robot']) > 0.01:
+                vprint(f"  📏 Hit distance changed: {result['hit_distance_original']:.3f}m → {result['hit_distance_robot']:.3f}m")
+
+        # 8) 시각화
+        vprint("\n=== 7. Creating Visualizations ===")
+        viz_start_time = time.time()
+        
+        import os
+        os.makedirs("visibility_test_output", exist_ok=True)
+        
+        # 2D 시각화 (URDF 기반 로봇 정보 포함)
+        fig, ax = plt.subplots(2, 2, figsize=(15, 10))
+        
+        # RGB with Query Points
+        ax[0,0].imshow(rgb_resized)
+        colors = ['cyan', 'red', 'green', 'yellow', 'magenta', 'orange', 'purple', 'brown']
+        for i, (uq, vq) in enumerate(query_pixels):
+            color = colors[i % len(colors)]
+            label = f'Query Point {i+1}' if N_QUERY_POINTS > 1 else 'Query Point'
+            ax[0,0].scatter([uq], [vq], c=color, s=40, marker='x', label=label)
+        ax[0,0].set_title(f'RGB with {N_QUERY_POINTS} Query Points')
+        ax[0,0].axis('off')
+        ax[0,0].legend()
+        
+        # Depth with Query Points
+        im = ax[0,1].imshow(depth_m, cmap='magma')
+        for i, (uq, vq) in enumerate(query_pixels):
+            color = colors[i % len(colors)]
+            label = f'Query Point {i+1}' if N_QUERY_POINTS > 1 else 'Query Point'
+            ax[0,1].scatter([uq], [vq], c=color, s=40, marker='x', label=label)
+        ax[0,1].set_title('Depth (m)')
+        ax[0,1].axis('off')
+        ax[0,1].legend()
+        fig.colorbar(im, ax=ax[0,1], shrink=0.7, label='meters')
+        
+        # Robot Joint Angles 정보
+        ax[1,0].text(0.1, 0.9, 'Robot Joint Angles:', transform=ax[1,0].transAxes, fontsize=12, fontweight='bold')
+        for i, joint_angles in enumerate(robot_joint_angles_list):
+            if len(joint_angles) > 0:
+                ax[1,0].text(0.1, 0.8 - i*0.1, f'Robot {i+1}: {joint_angles}', 
+                            transform=ax[1,0].transAxes, fontsize=10)
+        ax[1,0].set_title('Robot Joint Angles')
+        ax[1,0].axis('off')
+        
+        # End Effector Poses 정보
+        ax[1,1].text(0.1, 0.9, 'End Effector Poses:', transform=ax[1,1].transAxes, fontsize=12, fontweight='bold')
+        for i, pose in enumerate(end_effector_poses):
+            translation = pose[:3, 3]
+            ax[1,1].text(0.1, 0.8 - i*0.1, f'Pose {i+1}: [{translation[0]:.3f}, {translation[1]:.3f}, {translation[2]:.3f}]', 
+                        transform=ax[1,1].transAxes, fontsize=10)
+        ax[1,1].set_title('End Effector Poses')
+        ax[1,1].axis('off')
+        
+        plt.tight_layout()
+        plt.savefig("visibility_test_output/rgb_depth_query_with_robot_info.png", dpi=150, bbox_inches='tight')
+        plt.close()
+        vprint("2D visualization with robot info saved to: visibility_test_output/rgb_depth_query_with_robot_info.png")
+        
+        # Reward 매트릭스 시각화 (N개의 쿼리 포인트에 대해)
+        fig, ax = plt.subplots(1, 2, figsize=(15, 6))
+        
+        # Reward 매트릭스 히트맵 (M x L x N를 M x L로 평균화)
+        reward_matrix_2d = np.mean(reward_matrix, axis=2)  # N개 쿼리 포인트의 평균
+        im1 = ax[0].imshow(reward_matrix_2d, cmap='RdYlGn', vmin=0, vmax=1, aspect='auto')
+        ax[0].set_title(f'Reward Matrix (M x L) - Average of {N_QUERY_POINTS} Query Points\nGreen=Visible(1), Red=Occluded(0)')
+        ax[0].set_xlabel('Viewpoint Index (L)')
+        ax[0].set_ylabel('Viewpoint Set Index (M)')
+        
+        # 컬러바 추가
+        cbar1 = plt.colorbar(im1, ax=ax[0], shrink=0.8)
+        cbar1.set_label('Average Reward (1.0=Visible, 0.0=Occluded)')
+        
+        # 각 셀에 값 표시
+        for i in range(M):
+            for j in range(L):
+                text = ax[0].text(j, i, f'{reward_matrix_2d[i, j]:.2f}',
+                                ha="center", va="center", color="black", fontweight='bold')
+        
+        # 최종 reward 막대 그래프
+        bars = ax[1].bar(range(1, M+1), final_rewards, color=['skyblue', 'lightgreen', 'lightcoral'][:M])
+        ax[1].set_title('Final Rewards per Viewpoint Set')
+        ax[1].set_xlabel('Viewpoint Set Index (M)')
+        ax[1].set_ylabel('Total Reward')
+        ax[1].set_ylim(0, L + 0.5)
+        
+        # 각 막대 위에 값 표시
+        for i, reward in enumerate(final_rewards):
+            ax[1].text(i+1, reward + 0.1, f'{reward:.1f}', ha='center', va='bottom', fontweight='bold')
+        
+        plt.tight_layout()
+        plt.savefig("visibility_test_output/reward_analysis.png", dpi=150, bbox_inches='tight')
+        plt.close()
+        vprint("Reward analysis visualization saved to: visibility_test_output/reward_analysis.png")
+
+        # 3D 시각화 - 각 robot별로 독립적인 시각화 생성
+        vprint("Creating individual 3D visualizations for each robot...")
+        
+        # 각 robot별로 시각화 생성
+        for robot_idx in range(L):
+            vprint(f"Creating visualization for robot {robot_idx + 1}...")
+            
+            # 현재 robot과 관련 데이터
+            current_robot_meshes = robot_meshes_list[robot_idx] if robot_idx < len(robot_meshes_list) else {}
+            current_joint_angles = robot_joint_angles_list[robot_idx] if robot_idx < len(robot_joint_angles_list) else np.zeros(6)
+            
+            # 현재 robot에 대한 visibility 결과만 추출 (모든 viewpoint set에서)
+            current_robot_results = []
+            for set_idx in range(M):
+                visible = visibility_results[set_idx, robot_idx]
+                hit_distance = hit_distances[set_idx, robot_idx]
+                viewpoint = CANDIDATE_VIEWPOINTS_MATRIX[set_idx, robot_idx]
+                viewdirection = CANDIDATE_ROTATIONS_MATRIX[set_idx, robot_idx]
+                # 각 viewpoint에서 query point까지의 거리 계산
+                distance_to_query = np.linalg.norm(Xw_q - viewpoint)
+                
+                result = {
+                    'viewpoint': viewpoint,
+                    'visible_robot': visible,
+                    'visible_original': visible,  # 호환성을 위해 동일하게 설정
+                    'hit_distance_robot': hit_distance,
+                    'hit_distance_original': hit_distance,  # 호환성을 위해 동일하게 설정
+                    'distance_to_query': distance_to_query
+                }
+                current_robot_results.append(result)
+            
+            # 현재 robot에 대한 시각화 생성 (robot meshes와 scene mesh 결합)
+            create_robot_3d_visualization_plotly(
+                mesh_original, current_robot_meshes, query_points_3d, CANDIDATE_VIEWPOINTS_MATRIX[:, robot_idx], CANDIDATE_ROTATIONS_MATRIX[:, robot_idx], 
+                current_robot_results, current_joint_angles,
+                f"visibility_test_output/3d_visualization_robot_{robot_idx + 1}.html",
+                robot_viz, image_size, K_adjusted
+            )
+        
+        # 모든 robot 시각화를 하나의 애니메이션 HTML로 저장
+        create_robot_3d_visualization_plotly_animate(
+            mesh_original, robot_meshes_list, query_points_3d,
+            CANDIDATE_VIEWPOINTS_MATRIX, CANDIDATE_ROTATIONS_MATRIX,
+            visibility_results, robot_joint_angles_list,
+            "visibility_test_output/3d_visualization_animate.html",
             robot_viz, image_size, K_adjusted
         )
-    
-    # 모든 robot 시각화를 하나의 애니메이션 HTML로 저장
-    create_robot_3d_visualization_plotly_animate(
-        mesh_original, robot_meshes_list, query_points_3d,
-        CANDIDATE_VIEWPOINTS_MATRIX, CANDIDATE_ROTATIONS_MATRIX,
-        visibility_results, robot_joint_angles_list,
-        "visibility_test_output/3d_visualization_animate.html",
-        robot_viz, image_size, K_adjusted
-    )
-    vprint("Animated 3D visualization saved to: visibility_test_output/3d_visualization_animate.html")
+        vprint("Animated 3D visualization saved to: visibility_test_output/3d_visualization_animate.html")
 
-    # 모든 robot 시각화를 포인트 클라우드 애니메이션 HTML로 저장
-    create_robot_3d_visualization_plotly_animate_point_cloud(
-        mesh_original, robot_meshes_list, query_points_3d,
-        CANDIDATE_VIEWPOINTS_MATRIX, CANDIDATE_ROTATIONS_MATRIX,
-        visibility_results, robot_joint_angles_list,
-        "visibility_test_output/3d_visualization_animate_point_cloud.html",
-        robot_viz, image_size, K_adjusted,
-        rgb_image=rgb_resized, depth_image=depth_m
-    )
-    vprint("Animated 3D point cloud visualization saved to: visibility_test_output/3d_visualization_animate_point_cloud.html")
+        # 모든 robot 시각화를 포인트 클라우드 애니메이션 HTML로 저장
+        create_robot_3d_visualization_plotly_animate_point_cloud(
+            mesh_original, robot_meshes_list, query_points_3d,
+            CANDIDATE_VIEWPOINTS_MATRIX, CANDIDATE_ROTATIONS_MATRIX,
+            visibility_results, robot_joint_angles_list,
+            "visibility_test_output/3d_visualization_animate_point_cloud.html",
+            robot_viz, image_size, K_adjusted,
+            rgb_image=rgb_resized, depth_image=depth_m
+        )
+        vprint("Animated 3D point cloud visualization saved to: visibility_test_output/3d_visualization_animate_point_cloud.html")
 
+    # Multi-frame scene mesh 애니메이션을 위한 RGB-D 데이터 로드
+    vprint("\nLoading multiple frames for multiframe visualization...")
+    num_multiframe_frames = 300  # 디버깅을 위해 매우 적게 설정
+    rgb_frames_list = []
+    depth_frames_list = []
+    relative_poses_list = []
+    K_adjusted_list = []
+    T_mc_list = []
+    action_list = []
+    
+    for frame_offset in range(num_multiframe_frames):
+        current_frame_idx = FRAME_IDX + frame_offset
+        
+        # RGB-D 데이터 로드
+        rgb, depth_raw, fake_depth_mask, relative_pose, T_mc, act = get_data(rgb_frames, depth_frames, relative_poses, combined_mask, T_mc_transformation, action, current_frame_idx, DEPTH_SCALE)
+        # 1.5) 이미지 리사이즈 (옵션) - UniDepth 사용시에는 RGB만 리사이즈
+        if RESIZE:
+            rgb_resized, _, scale_factor_x, scale_factor_y = resize_image_and_depth(rgb, depth_raw, RESIZE_SIZE)
+        else:
+            rgb_resized = rgb
+        
+        depth_m = depth_processing(rgb, depth_raw, fake_depth_mask, model, camera)
+        
+        
+        rgb_frames_list.append(rgb_resized)
+        depth_frames_list.append(depth_m)
+        relative_poses_list.append(relative_pose)
+        K_adjusted_list.append(K_adjusted)
+        T_mc_list.append(T_mc)
+        action_list.append(act)
+        vprint(f"  Loaded frame {frame_offset + 1}/{num_multiframe_frames} (index: {current_frame_idx})")
+            
+    vprint(f"Successfully loaded {len(rgb_frames_list)} frames for multiframe visualization")
     
     
-    viz_end_time = time.time()
-    print(f"Visualization time: {viz_end_time - viz_start_time:.4f} seconds")
+    
+    # NVBlox 방식의 Multi-frame scene mesh 애니메이션 생성 (sun3d.py 방식)
+    if len(rgb_frames_list) > 0:
+        create_multiframe_nvblox(
+            "visibility_test_output/3d_visualization_animate_multiframe_nvblox.ply",
+            rgb_frames_list, depth_frames_list, relative_poses_list, K_adjusted_list, T_mc_list, action_list,
+            robot_viz=robot_viz,
+            voxel_size=VOXEL_SIZE,
+            export_interactive_html=False,  # Interactive HTML export 활성화
+            query_points_3d=query_points_3d,  # LOS 시각화를 위한 쿼리 포인트들
+            image_size=image_size,
+        )
+        vprint("NVBlox multi-frame scene mesh animated visualization saved to: visibility_test_output/3d_visualization_animate_multiframe_nvblox.html")
+    else:
+        vprint("No frames loaded for multiframe visualization")
+    
+    if not DEBUG:    
+        viz_end_time = time.time()
+        print(f"Visualization time: {viz_end_time - viz_start_time:.4f} seconds")
 
-    # 전체 실행 시간
-    total_end_time = time.time()
-    print(f"\n=== Total Execution Time: {total_end_time - total_start_time:.4f} seconds ===")
+        # 전체 실행 시간
+        total_end_time = time.time()
+        print(f"\n=== Total Execution Time: {total_end_time - total_start_time:.4f} seconds ===")
 
-    # 결과 요약
-    print("\n=== Summary ===")
-    print(f"Configuration: M={M} viewpoint sets, L={L} viewpoints per set")
-    print(f"Total viewpoints processed: {M} x {L} = {M*L}")
-    
-    # 각 viewpoint set별 요약
-    print(f"\nViewpoint Set Analysis:")
-    for set_idx in range(M):
-        visible_count = np.sum(visibility_results[set_idx])
-        total_reward = final_rewards[set_idx]
-        print(f"  Set {set_idx + 1}: {visible_count}/{L} visible viewpoints, reward = {total_reward:.1f}")
-    
-    # 전체 통계
-    total_visible = np.sum(visibility_results)
-    total_possible = M * L * N_QUERY_POINTS
-    overall_visibility_rate = total_visible / total_possible * 100
-    
-    print(f"\nOverall Statistics:")
-    print(f"  Total visible viewpoints: {total_visible}/{total_possible} ({overall_visibility_rate:.1f}%)")
-    print(f"  Average reward per set: {np.mean(final_rewards):.2f}")
-    print(f"  Best performing set: Set {np.argmax(final_rewards) + 1} (reward: {np.max(final_rewards):.1f})")
-    print(f"  Worst performing set: Set {np.argmin(final_rewards) + 1} (reward: {np.min(final_rewards):.1f})")
-    
-    # Reward 매트릭스 요약
-    print(f"\nReward Matrix Summary:")
-    print(f"  Matrix shape: {reward_matrix.shape} (M x L x N)")
-    print(f"  Total reward sum: {np.sum(final_rewards):.1f}")
-    print(f"  Reward variance: {np.var(final_rewards):.2f}")
-    
-    # 각 쿼리 포인트별 상세 통계
-    print(f"\nQuery Point Detailed Statistics:")
-    for query_idx in range(N_QUERY_POINTS):
-        query_visibility = visibility_results[:, :, query_idx]
-        total_visible_query = np.sum(query_visibility)
-        total_possible_query = M * L
-        visibility_rate_query = total_visible_query / total_possible_query * 100
-        print(f"  Query {query_idx + 1}: {total_visible_query}/{total_possible_query} visible ({visibility_rate_query:.1f}%)")
-    
-    print("\nDetailed results (first viewpoint set only):")
-    for i, result in enumerate(results):
-        # result['visible_robot']이 배열인 경우 첫 번째 요소 사용
-        visible_robot = result['visible_robot']
-        if hasattr(visible_robot, '__len__') and not isinstance(visible_robot, (str, bool)):
-            visible_robot = visible_robot[0]
-        status_robot = "VISIBLE" if visible_robot else "OCCLUDED"
-        print(f"  Viewpoint {i+1}: {status_robot} (hit_distance: {result['hit_distance_robot']:.3f}m)")
+        # 결과 요약
+        print("\n=== Summary ===")
+        print(f"Configuration: M={M} viewpoint sets, L={L} viewpoints per set")
+        print(f"Total viewpoints processed: {M} x {L} = {M*L}")
+        
+        # 각 viewpoint set별 요약
+        print(f"\nViewpoint Set Analysis:")
+        for set_idx in range(M):
+            visible_count = np.sum(visibility_results[set_idx])
+            total_reward = final_rewards[set_idx]
+            print(f"  Set {set_idx + 1}: {visible_count}/{L} visible viewpoints, reward = {total_reward:.1f}")
+        
+        # 전체 통계
+        total_visible = np.sum(visibility_results)
+        total_possible = M * L * N_QUERY_POINTS
+        overall_visibility_rate = total_visible / total_possible * 100
+        
+        print(f"\nOverall Statistics:")
+        print(f"  Total visible viewpoints: {total_visible}/{total_possible} ({overall_visibility_rate:.1f}%)")
+        print(f"  Average reward per set: {np.mean(final_rewards):.2f}")
+        print(f"  Best performing set: Set {np.argmax(final_rewards) + 1} (reward: {np.max(final_rewards):.1f})")
+        print(f"  Worst performing set: Set {np.argmin(final_rewards) + 1} (reward: {np.min(final_rewards):.1f})")
+        
+        # Reward 매트릭스 요약
+        print(f"\nReward Matrix Summary:")
+        print(f"  Matrix shape: {reward_matrix.shape} (M x L x N)")
+        print(f"  Total reward sum: {np.sum(final_rewards):.1f}")
+        print(f"  Reward variance: {np.var(final_rewards):.2f}")
+        
+        # 각 쿼리 포인트별 상세 통계
+        print(f"\nQuery Point Detailed Statistics:")
+        for query_idx in range(N_QUERY_POINTS):
+            query_visibility = visibility_results[:, :, query_idx]
+            total_visible_query = np.sum(query_visibility)
+            total_possible_query = M * L
+            visibility_rate_query = total_visible_query / total_possible_query * 100
+            print(f"  Query {query_idx + 1}: {total_visible_query}/{total_possible_query} visible ({visibility_rate_query:.1f}%)")
+        
+        print("\nDetailed results (first viewpoint set only):")
+        for i, result in enumerate(results):
+            # result['visible_robot']이 배열인 경우 첫 번째 요소 사용
+            visible_robot = result['visible_robot']
+            if hasattr(visible_robot, '__len__') and not isinstance(visible_robot, (str, bool)):
+                visible_robot = visible_robot[0]
+            status_robot = "VISIBLE" if visible_robot else "OCCLUDED"
+            print(f"  Viewpoint {i+1}: {status_robot} (hit_distance: {result['hit_distance_robot']:.3f}m)")
 
 
 if __name__ == "__main__":
