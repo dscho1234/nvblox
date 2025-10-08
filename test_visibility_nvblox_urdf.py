@@ -394,7 +394,7 @@ class Z1RobotVisualizer:
         
         transformed_meshes = {}
         for link_name, mesh in self.meshes.items():
-            start = time.time()
+            
             if link_name in self.link_transforms:
                 if T_target is not None:
                     # 월드 좌표계에서 목표 좌표계로 변환
@@ -481,7 +481,7 @@ BUFFER_PATH = "/home/dscho1234/fast_storage/dscho/im2flow2act/data/realworld_hum
 EPISODE_IDX = 2
 FRAME_IDX = 0  # 특정 프레임 선택
 DEPTH_SCALE = 0.001        # 깊이 단위 → 미터 변환 (예: mm면 0.001, 이미 m면 1.0)
-OFFSET_DISTANCE = 0.05 # for convex part of the constructed mesh
+OFFSET_DISTANCE = 0.01 # for convex part of the constructed mesh
 
 # 쿼리 포인트 개수 설정
 N_QUERY_POINTS = 3  # 선택할 쿼리 포인트의 개수 (N=1일 때도 정상 작동)
@@ -2539,6 +2539,7 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, rela
         action = action_list[frame_idx] # [7]
         action_se3 = np.eye(4)
         action_se3[:3, 3] = action[:3]
+        # action_se3[:3, 3] = np.array([0.7, 0.05, 0.15]) # NOTE: dscho debug (straight forward configuration)
         action_se3[:3, :3] = R.from_euler('xyz', action[3:6], degrees=False).as_matrix()
         gripper_action = action[6]
         tracking_3d = tracking_3d_list[frame_idx] # [N, 3]
@@ -2616,7 +2617,7 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, rela
         for link_name, robot_mesh in robot_meshes.items():
             if robot_mesh is not None and len(robot_mesh.vertices) > 0:
                 combined_mesh += robot_mesh
-                vprint(f"    Added robot link {link_name}: {len(robot_mesh.vertices)} vertices")
+                print(f"    Added robot link {link_name}: {len(robot_mesh.vertices)} vertices")
         
         if len(combined_mesh.vertices) == 0:
             print("  WARNING: Combined mesh has no vertices!")
