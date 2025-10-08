@@ -79,7 +79,7 @@ class Z1RobotVisualizer:
             'link05': [0.2, 0.8, 0.8],         # 청록색 (링크5)
             'link06': [0.5, 0.5, 0.5],         # 회색 (링크6)
             'z1_GripperMover': [0.9, 0.5, 0.1],   # 주황색 (그리퍼)
-            'z1_GripperStator': [0.9, 0.5, 0.1],  # 주황색 (그리퍼)
+            'z1_GripperStator': [0.5, 0.9, 0.1],  # 연두색 (그리퍼)
         }
 
 
@@ -130,38 +130,34 @@ class Z1RobotVisualizer:
                             # package:// 경로를 실제 파일 경로로 변환
                             mesh_path = mesh_filename.replace('package://z1_description/', self.mesh_base_path)
                             
-                            try:
-                                # 먼저 STL 파일 시도
-                                stl_path = mesh_path.replace('.dae', '.STL').replace('visual/', 'collision/')
-                                if os.path.exists(stl_path):
-                                    # STL 파일 로드
-                                    mesh_obj = o3d.io.read_triangle_mesh(stl_path)
-                                    if len(mesh_obj.vertices) > 0:
-                                        mesh_obj.vertex_colors = o3d.utility.Vector3dVector(np.tile(np.array(self.link_colors[link_name])[None, :], (len(mesh_obj.vertices), 1)))
-                                        self.meshes[link_name] = mesh_obj
-                                        vprint(f"STL 메시 로드 성공: {link_name} -> {stl_path} ({len(mesh_obj.vertices)} vertices)")
-                                        continue
+                            # 먼저 STL 파일 시도
+                            stl_path = mesh_path.replace('.dae', '.STL').replace('visual/', 'collision/')
+                            if os.path.exists(stl_path):
+                                # STL 파일 로드
+                                mesh_obj = o3d.io.read_triangle_mesh(stl_path)
+                                if len(mesh_obj.vertices) > 0:
+                                    mesh_obj.vertex_colors = o3d.utility.Vector3dVector(np.tile(np.array(self.link_colors[link_name])[None, :], (len(mesh_obj.vertices), 1)))
+                                    self.meshes[link_name] = mesh_obj
+                                    vprint(f"STL 메시 로드 성공: {link_name} -> {stl_path} ({len(mesh_obj.vertices)} vertices)")
+                                    continue
+                            
+                            # DAE 파일 시도
+                            trimesh_obj = trimesh.load(mesh_path)
+                            
+                            # Open3D 메시로 변환
+                            if hasattr(trimesh_obj, 'vertices') and hasattr(trimesh_obj, 'faces'):
+                                mesh_obj = o3d.geometry.TriangleMesh()
+                                mesh_obj.vertices = o3d.utility.Vector3dVector(trimesh_obj.vertices)
+                                mesh_obj.triangles = o3d.utility.Vector3iVector(trimesh_obj.faces)
                                 
-                                # DAE 파일 시도
-                                trimesh_obj = trimesh.load(mesh_path)
-                                
-                                # Open3D 메시로 변환
-                                if hasattr(trimesh_obj, 'vertices') and hasattr(trimesh_obj, 'faces'):
-                                    mesh_obj = o3d.geometry.TriangleMesh()
-                                    mesh_obj.vertices = o3d.utility.Vector3dVector(trimesh_obj.vertices)
-                                    mesh_obj.triangles = o3d.utility.Vector3iVector(trimesh_obj.faces)
-                                    
-                                    if len(mesh_obj.vertices) > 0:
-                                        self.meshes[link_name] = mesh_obj
-                                        vprint(f"DAE 메시 로드 성공: {link_name} -> {mesh_path} ({len(mesh_obj.vertices)} vertices)")
-                                    else:
-                                        vprint(f"빈 메시: {link_name}")
+                                if len(mesh_obj.vertices) > 0:
+                                    self.meshes[link_name] = mesh_obj
+                                    vprint(f"DAE 메시 로드 성공: {link_name} -> {mesh_path} ({len(mesh_obj.vertices)} vertices)")
                                 else:
-                                    vprint(f"메시 형식 오류: {link_name}")
-                            except Exception as e:
-                                vprint(f"메시 로드 실패: {link_name} - {e}")
-                                # 메시 로드 실패 시 간단한 기하학적 모양 생성
-                                self.create_simple_geometry(link_name)
+                                    vprint(f"빈 메시: {link_name}")
+                            else:
+                                vprint(f"메시 형식 오류: {link_name}")
+                        
         
         # Gripper 메시도 로드 (URDF에 정의되지 않았지만 메시 파일이 있음)
         self.load_gripper_meshes()
@@ -202,36 +198,7 @@ class Z1RobotVisualizer:
             except Exception as e:
                 vprint(f"Gripper 메시 로드 실패: {gripper_name} - {e}")
                                 
-    def create_simple_geometry(self, link_name):
-        """메시 로드 실패 시 간단한 기하학적 모양 생성"""
-        # 링크별로 적절한 크기의 기하학적 모양 생성
-        if link_name == 'link00':
-            # 베이스 링크 - 원통
-            mesh = o3d.geometry.TriangleMesh.create_cylinder(radius=0.0325, height=0.051)
-        elif link_name == 'link01':
-            # 첫 번째 링크 - 원통
-            mesh = o3d.geometry.TriangleMesh.create_cylinder(radius=0.03, height=0.045)
-        elif link_name == 'link02':
-            # 두 번째 링크 - 박스
-            mesh = o3d.geometry.TriangleMesh.create_box(width=0.35, height=0.102, depth=0.102)
-        elif link_name == 'link03':
-            # 세 번째 링크 - 박스
-            mesh = o3d.geometry.TriangleMesh.create_box(width=0.116, height=0.059, depth=0.059)
-        elif link_name == 'link04':
-            # 네 번째 링크 - 원통
-            mesh = o3d.geometry.TriangleMesh.create_cylinder(radius=0.0325, height=0.067)
-        elif link_name == 'link05':
-            # 다섯 번째 링크 - 원통
-            mesh = o3d.geometry.TriangleMesh.create_cylinder(radius=0.025, height=0.0492)
-        elif link_name == 'link06':
-            # 여섯 번째 링크 - 원통
-            mesh = o3d.geometry.TriangleMesh.create_cylinder(radius=0.0325, height=0.051)
-        else:
-            # 기본 - 구
-            mesh = o3d.geometry.TriangleMesh.create_sphere(radius=0.02)
-            
-        self.meshes[link_name] = mesh
-        vprint(f"간단한 기하학적 모양 생성: {link_name}")
+    
                                 
     def set_joint_angles(self, angles):
         """조인트 각도 설정"""
@@ -510,7 +477,7 @@ class Z1RobotVisualizer:
 
 # ========= 사용자 설정 =========
 # Zarr 데이터 경로 설정
-BUFFER_PATH = "/home/dscho1234/fast_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/single_marker_bottle_under_table_wilor"
+BUFFER_PATH = "/home/dscho1234/fast_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/single_marker_no_hand_object"
 EPISODE_IDX = 2
 FRAME_IDX = 0  # 특정 프레임 선택
 DEPTH_SCALE = 0.001        # 깊이 단위 → 미터 변환 (예: mm면 0.001, 이미 m면 1.0)
@@ -540,7 +507,7 @@ USE_MONODEPTH = False # True  # True: UniDepth 사용, False: raw depth 사용
 MODEL_TYPE = "l"  # UniDepth model type: s, b, l
 
 
-USE_FAKE_DEPTH = True
+USE_FAKE_DEPTH = False # True
 FAKE_DEPTH_VALUE = 0
 
 # 이미지 리사이즈 설정
@@ -2634,8 +2601,8 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, rela
 
         # dscho debug
         # NOTE: assume gripper_action is in [0 (open), 1 (close)]
-        # [-1, 0] -> [-np.pi, 0]
-        gripper_angle = (gripper_action-1)*np.pi # unit : (radian)
+        # [-1, 0] -> [-np.pi/2, 0]
+        gripper_angle = (gripper_action-1)*np.pi/2 # unit : (radian)
         
         # Inverse Kinematics로 조인트 각도 계산
         ik_success = robot_viz.solve_inverse_kinematics(action_se3, gripper_angle=gripper_angle)
@@ -3517,7 +3484,7 @@ def main():
 
     # Multi-frame scene mesh 애니메이션을 위한 RGB-D 데이터 로드
     vprint("\nLoading multiple frames for multiframe visualization...")
-    num_multiframe_frames = 250  # 디버깅을 위해 매우 적게 설정
+    num_multiframe_frames = 390  # 디버깅을 위해 매우 적게 설정
     rgb_frames_list = []
     depth_frames_list = []
     relative_poses_list = []
