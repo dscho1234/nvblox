@@ -2278,6 +2278,10 @@ class CustomVisualizerV3(Visualizer):
             self.visibility_results = None
             self.camera_intrinsics = None
             self.image_size = None
+            self.pending_camera_updates = {}  # Store pending camera updates for each visualizer
+            
+            name = 'color_mesh'
+            self.visualizers[name] = self._create_visualizer(name)
         
         def _create_visualizer(self, window_name: str):
             """Create visualizer with custom settings for LOS visualization"""
@@ -2292,6 +2296,46 @@ class CustomVisualizerV3(Visualizer):
             visualizer.register_key_callback(ord(' '), lambda vis: self._toggle_pause(vis))
             return visualizer
         
+        def _loop_while_paused(self):
+            """Override to capture camera position continuously while paused"""
+            
+            while self.pause:
+                for visualizer_name, visualizer in self.visualizers.items():
+                    visualizer.poll_events()
+                    visualizer.update_renderer()
+                    
+                    # Continuously capture camera position while paused
+                    view_control = visualizer.get_view_control()
+                    camera_params = view_control.convert_to_pinhole_camera_parameters()
+                    view_status = visualizer.get_view_status()
+                    
+                    # Store camera update for later application
+                    self.pending_camera_updates[visualizer_name] = {
+                        'camera_params': camera_params,
+                        'view_status': view_status,
+                    }
+                    
+                
+                
+                time.sleep(0.001)
+        
+        def _update_visualization(self, visualizer: o3d.visualization.VisualizerWithKeyCallback, visualizer_name: str) -> None:
+            visualizer.poll_events()
+            visualizer.update_renderer()
+            
+            view_control = visualizer.get_view_control()
+            camera_params = view_control.convert_to_pinhole_camera_parameters()
+            view_status = visualizer.get_view_status()
+            
+            # Store camera update for later application
+            self.pending_camera_updates[visualizer_name] = {
+                'camera_params': camera_params,
+                'view_status': view_status,
+            }
+            time.sleep(0.001)
+
+
+
         def _visualize_nvblox_mesh(self, color_mesh, name='color_mesh'):
             if name not in self.visualizers:
                 self.visualizers[name] = self._create_visualizer(name)
@@ -2418,13 +2462,8 @@ class CustomVisualizerV3(Visualizer):
             if image_size is not None:
                 self.image_size = image_size
             
-            # Initialize view controllers if needed
-            self._initialize_view_controllers_if_needed()
 
             # Store current views before updating
-            for name, visualizer in self.visualizers.items():
-                if name in self.view_controllers:
-                    self.view_controllers[name].store_camera_pose(visualizer)
 
             if color_mesh is not None:
                 self._visualize_nvblox_mesh(color_mesh)
@@ -2454,7 +2493,6 @@ class CustomVisualizerV3(Visualizer):
                     self.los_geometries[name] = line_set
                     visualizer.add_geometry(line_set)
                     
-                    print(f"Added LOS visualization: {len(query_points)} lines from camera to query points")
             
             # for name, visualizer in self.visualizers.items():
             #     visualizer.update_renderer()
@@ -2468,15 +2506,15 @@ class CustomVisualizerV3(Visualizer):
 
             # Restore views and update
             for name, visualizer in self.visualizers.items():
-                if name in self.view_controllers:
-                    self.view_controllers[name].restore_viewpoint(visualizer)
-                self._update_visualization(visualizer)
+                if name in self.pending_camera_updates:
+                    visualizer.set_view_status(self.pending_camera_updates[name]['view_status'])
+                self._update_visualization(visualizer, name)
 
             # Handle pausing
             if self.pause:
                 self._loop_while_paused()
         
-        
+
 
 def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, relative_poses_list, K_adjusted_list, T_mc_list, action_list, tracking_3d_list, robot_viz=None, voxel_size=0.01, export_interactive_html=True, image_size=None):
     """
@@ -2617,7 +2655,7 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, rela
         for link_name, robot_mesh in robot_meshes.items():
             if robot_mesh is not None and len(robot_mesh.vertices) > 0:
                 combined_mesh += robot_mesh
-                print(f"    Added robot link {link_name}: {len(robot_mesh.vertices)} vertices")
+                vprint(f"    Added robot link {link_name}: {len(robot_mesh.vertices)} vertices")
         
         if len(combined_mesh.vertices) == 0:
             print("  WARNING: Combined mesh has no vertices!")
