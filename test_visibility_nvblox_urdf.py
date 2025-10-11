@@ -21,7 +21,7 @@ from urdf_parser_py.urdf import URDF
 import xml.etree.ElementTree as ET
 from scipy.spatial.transform import Rotation as R
 import trimesh
-
+import cv2
 # Unitree Z1 SDK 추가
 sys.path.append(os.path.join(os.path.dirname(__file__), "unitree_ros_to_real", "unitree_legged_sdk", "lib"))
 sys.path.append("/home/dscho1234/Workspace/z1_sdk/lib")
@@ -36,9 +36,9 @@ from im2flow2act.common.utility.zarr import parallel_reading
 
 # nvblox imports
 from nvblox_torch.mapper import Mapper
-from nvblox_torch.mapper_params import MapperParams, ProjectiveIntegratorParams
+from nvblox_torch.mapper_params import MapperParams, ProjectiveIntegratorParams, TsdfDecayIntegratorParams, MeshIntegratorParams
 import open3d as o3d
-
+import cv2
 # ========= Verbose logging control =========
 VERBOSE = False
 
@@ -70,18 +70,29 @@ class Z1RobotVisualizer:
         self.meshes = {}  # 로드된 메시들 저장
         # color
 
+        # self.link_colors = {
+        #     'link00': [0.8, 0.2, 0.2],      # 빨간색 (베이스)
+        #     'link01': [0.2, 0.8, 0.2],         # 초록색 (링크1)
+        #     'link02': [0.2, 0.2, 0.8],         # 파란색 (링크2)
+        #     'link03': [0.8, 0.8, 0.2],         # 노란색 (링크3)
+        #     'link04': [0.8, 0.2, 0.8],         # 자홍색 (링크4)
+        #     'link05': [0.2, 0.8, 0.8],         # 청록색 (링크5)
+        #     'link06': [0.5, 0.5, 0.5],         # 회색 (링크6)
+        #     'z1_GripperMover': [0.9, 0.5, 0.1],   # 주황색 (그리퍼)
+        #     'z1_GripperStator': [0.5, 0.9, 0.1],  # 연두색 (그리퍼)
+        # }
+        # silver 
         self.link_colors = {
-            'link00': [0.8, 0.2, 0.2],      # 빨간색 (베이스)
-            'link01': [0.2, 0.8, 0.2],         # 초록색 (링크1)
-            'link02': [0.2, 0.2, 0.8],         # 파란색 (링크2)
-            'link03': [0.8, 0.8, 0.2],         # 노란색 (링크3)
-            'link04': [0.8, 0.2, 0.8],         # 자홍색 (링크4)
-            'link05': [0.2, 0.8, 0.8],         # 청록색 (링크5)
-            'link06': [0.5, 0.5, 0.5],         # 회색 (링크6)
-            'z1_GripperMover': [0.9, 0.5, 0.1],   # 주황색 (그리퍼)
-            'z1_GripperStator': [0.5, 0.9, 0.1],  # 연두색 (그리퍼)
+            'link00': [0.8, 0.8, 0.8],    
+            'link01': [0.8, 0.8, 0.8],         
+            'link02': [0.8, 0.8, 0.8],         
+            'link03': [0.8, 0.8, 0.8],         
+            'link04': [0.8, 0.8, 0.8],         
+            'link05': [0.8, 0.8, 0.8],         
+            'link06': [0.8, 0.8, 0.8],         
+            'z1_GripperMover': [0.8, 0.8, 0.8],  
+            'z1_GripperStator': [0.8, 0.8, 0.8],
         }
-
 
         # Unitree Z1 SDK 초기화
         try:
@@ -477,16 +488,16 @@ class Z1RobotVisualizer:
 
 # ========= 사용자 설정 =========
 # Zarr 데이터 경로 설정
-BUFFER_PATH = "/home/dscho1234/fast_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/single_marker_no_hand_object"
-EPISODE_IDX = 2
+BUFFER_PATH = "/home/dscho1234/fast_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/single_marker_bottle_under_table_wilor"
+EPISODE_IDX = 7
 FRAME_IDX = 0  # 특정 프레임 선택
 DEPTH_SCALE = 0.001        # 깊이 단위 → 미터 변환 (예: mm면 0.001, 이미 m면 1.0)
-OFFSET_DISTANCE = 0.01 # for convex part of the constructed mesh
+OFFSET_DISTANCE = 0.05 # for convex part of the constructed mesh
 
 # 쿼리 포인트 개수 설정
 N_QUERY_POINTS = 3  # 선택할 쿼리 포인트의 개수 (N=1일 때도 정상 작동)
 
-# TSDF 설정
+
 # Mesh 품질 선택: "high_resolution" (5mm), "medium_resolution" (10mm), "low_resolution" (20mm)
 MESH_QUALITY = "medium_resolution" # "medium_resolution"  # "high_resolution", "medium_resolution", "low_resolution"
 
@@ -507,11 +518,11 @@ USE_MONODEPTH = False # True  # True: UniDepth 사용, False: raw depth 사용
 MODEL_TYPE = "l"  # UniDepth model type: s, b, l
 
 
-USE_FAKE_DEPTH = False # True
-FAKE_DEPTH_VALUE = 0
+USE_FAKE_DEPTH = True
+FAKE_DEPTH_VALUE = np.nan # 0
 
 # 이미지 리사이즈 설정
-RESIZE = True # True: 이미지를 256x256으로 리사이즈, False: 원본 크기 사용
+RESIZE = True  # True: 이미지를 256x256으로 리사이즈, False: 원본 크기 사용
 RESIZE_SIZE = (256, 256)  # 리사이즈할 크기 (width, height)
 IMAGE_SIZE = (640, 480)
 # (중요) 카메라 내파라미터: 사용자가 직접 채우세요.
@@ -726,7 +737,7 @@ def resize_image_and_depth(rgb, depth, target_size=(256, 256)):
         resized_depth: 리사이즈된 depth 이미지
         scale_factor: 스케일 팩터 (원본 크기 / 리사이즈 크기)
     """
-    import cv2
+    
     
     H, W = rgb.shape[:2]
     target_w, target_h = target_size
@@ -1096,10 +1107,10 @@ def create_mesh_with_nvblox(depth_image, rgb_image, K, pose, voxel_size=0.005, m
         mapper_params = MapperParams()
         mapper_params.set_projective_integrator_params(projective_integrator_params)
         
+
         # Mapper 생성
         mapper = Mapper(
             voxel_sizes_m=voxel_size,
-            # integrator_types=ProjectiveIntegratorType.TSDF,
             mapper_parameters=mapper_params
         )
     
@@ -1271,8 +1282,7 @@ def batch_raycasting_with_scene(scene, origins, directions, max_distances):
     # Visibility 판단: hit이 inf이거나 max_distance보다 크면 visible
     visible = np.logical_or(np.isinf(hit_distances), hit_distances > max_distances)
     
-    # Hit distance 조정: visible한 경우 max_distance로 설정
-    hit_distances_adjusted = np.where(visible, max_distances, hit_distances)
+    
     step3_time = time.time() - step3_start
     vprint(f"      Step 3 - Result processing: {step3_time:.4f}s")
     
@@ -1282,7 +1292,7 @@ def batch_raycasting_with_scene(scene, origins, directions, max_distances):
     # 각 단계별 시간 요약
     vprint(f"      Time breakdown: rays={step1_time:.4f}s, casting={step2_time:.4f}s, processing={step3_time:.4f}s")
     
-    return visible, hit_distances_adjusted
+    return visible, hit_distances
 
 
 
@@ -2268,8 +2278,13 @@ class CustomVisualizerV3(Visualizer):
         """
         Custom visualizer that combines robot mesh with scene mesh in _visualize_nvblox_mesh
         and adds Line of Sight (LOS) visualization functionality
+        
+        Camera Control:
+        - follow_camera_view=False: Static camera view (uses initial camera pose)
+        - follow_camera_view=True: Dynamic camera view (follows each frame's camera pose)
+        - video_save: Enable/disable video recording
         """
-        def __init__(self, deep_feature_embedding_dim=None):
+        def __init__(self, deep_feature_embedding_dim=None, video_save=False, video_path="output_video.mp4", follow_camera_view=False):
             super().__init__(deep_feature_embedding_dim)
             self.los_geometries = {}  # Store LOS geometries for each visualizer
             self.camera_frustum_geometries = {}  # Store camera frustum geometries for each visualizer
@@ -2279,6 +2294,16 @@ class CustomVisualizerV3(Visualizer):
             self.camera_intrinsics = None
             self.image_size = None
             self.pending_camera_updates = {}  # Store pending camera updates for each visualizer
+            
+            # Video recording settings
+            self.video_save = video_save
+            self.video_path = video_path
+            self.captured_frames = []  # Store captured frames for video
+            self.initial_camera_pose = None  # Store initial camera pose
+            
+            # Camera following settings
+            self.follow_camera_view = follow_camera_view
+            self.current_camera_pose = None  # Store current camera pose for following
             
             name = 'color_mesh'
             self.visualizers[name] = self._create_visualizer(name)
@@ -2319,20 +2344,70 @@ class CustomVisualizerV3(Visualizer):
                 
                 time.sleep(0.001)
         
+        def set_initial_camera_pose(self, camera_pose):
+            """Set the initial camera pose for the visualizer"""
+            self.initial_camera_pose = camera_pose.copy()
+        
+        def set_current_camera_pose(self, camera_pose):
+            """Set the current camera pose for following mode"""
+            self.current_camera_pose = camera_pose.cpu().numpy().copy()
+        
+        def _set_camera_pose_from_matrix(self, visualizer, camera_pose_matrix):
+            """Set camera pose from 4x4 transformation matrix"""
+            
+            
+            # Convert torch tensor to numpy if needed
+            if isinstance(camera_pose_matrix, torch.Tensor):
+                camera_pose_matrix = camera_pose_matrix.cpu().numpy()
+            
+            # Extract camera position and orientation
+            camera_position = camera_pose_matrix[:3, 3]
+            camera_rotation = camera_pose_matrix[:3, :3]
+            
+            # Calculate lookat point (camera position + front direction)
+            front_direction = -camera_rotation[:, 2]  # Negative Z axis is front
+            lookat_point = camera_position + front_direction * 0.0  # Look 2 units ahead
+            
+            # Set camera parameters
+            view_control = visualizer.get_view_control()
+            view_control.set_lookat(lookat_point)
+            view_control.set_up(-camera_rotation[:, 1])  # Y axis is up
+            view_control.set_front(front_direction)
+            view_control.set_zoom(0.2)
+            
+            # Move camera to position
+            # view_control.camera_local_translate(0, 0, 1.0)
+        
+        def _capture_frame(self, visualizer, visualizer_name):
+            """Capture current frame for video recording"""
+            if self.video_save:
+                try:
+                    # Capture screen image
+                    image = visualizer.capture_screen_float_buffer(do_render=True)
+                    # Convert to numpy array and scale to 0-255
+                    image_np = np.asarray(image)
+                    image_np = (image_np * 255).astype(np.uint8)
+                    self.captured_frames.append(image_np)
+                except Exception as e:
+                    print(f"Failed to capture frame: {e}")
+        
         def _update_visualization(self, visualizer: o3d.visualization.VisualizerWithKeyCallback, visualizer_name: str) -> None:
             visualizer.poll_events()
             visualizer.update_renderer()
             
-            view_control = visualizer.get_view_control()
-            camera_params = view_control.convert_to_pinhole_camera_parameters()
-            view_status = visualizer.get_view_status()
-            
-            # Store camera update for later application
-            self.pending_camera_updates[visualizer_name] = {
-                'camera_params': camera_params,
-                'view_status': view_status,
-            }
-            time.sleep(0.001)
+            # Capture frame for video if enabled
+            self._capture_frame(visualizer, visualizer_name)
+            if visualizer_name in self.pending_camera_updates:
+                view_control = visualizer.get_view_control()
+                camera_params = view_control.convert_to_pinhole_camera_parameters()
+                view_status = visualizer.get_view_status()
+                
+                # Store camera update for later application
+                self.pending_camera_updates[visualizer_name] = {
+                    'camera_params': camera_params,
+                    'view_status': view_status,
+                }
+                time.sleep(0.001)
 
 
 
@@ -2462,6 +2537,9 @@ class CustomVisualizerV3(Visualizer):
             if image_size is not None:
                 self.image_size = image_size
             
+            # Update current camera pose if following mode is enabled
+            if self.follow_camera_view and camera_pose is not None:
+                self.set_current_camera_pose(camera_pose)
 
             # Store current views before updating
 
@@ -2508,21 +2586,53 @@ class CustomVisualizerV3(Visualizer):
             for name, visualizer in self.visualizers.items():
                 if name in self.pending_camera_updates:
                     visualizer.set_view_status(self.pending_camera_updates[name]['view_status'])
+                elif self.follow_camera_view and self.current_camera_pose is not None:
+                    # Follow camera mode: update camera pose to current pose
+                    self._set_camera_pose_from_matrix(self.visualizers[name], self.current_camera_pose)
+                    print(f"Updated camera pose for {name} (following mode)")
+                elif self.initial_camera_pose is not None:
+                    # Static mode: use initial camera pose
+                    self._set_camera_pose_from_matrix(self.visualizers[name], self.initial_camera_pose)
+                    print(f"Set initial camera pose for {name}")
                 self._update_visualization(visualizer, name)
 
             # Handle pausing
             if self.pause:
                 self._loop_while_paused()
         
+        def save_video(self):
+            """Save captured frames as MP4 video"""
+            if not self.video_save or len(self.captured_frames) == 0:
+                print("No frames captured or video saving disabled")
+                return
+            
+            # Get frame dimensions
+            height, width = self.captured_frames[0].shape[:2]
+            
+            # Define codec and create VideoWriter
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(self.video_path, fourcc, 20.0, (width, height))
+            
+            # Write frames
+            for frame in self.captured_frames:
+                # Convert RGB to BGR for OpenCV
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                out.write(frame_bgr)
+            
+            # Release everything
+            out.release()
+            print(f"Video saved to: {self.video_path}")
+            print(f"Total frames: {len(self.captured_frames)}")
+            
 
-
-def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, relative_poses_list, K_adjusted_list, T_mc_list, action_list, tracking_3d_list, robot_viz=None, voxel_size=0.01, export_interactive_html=True, image_size=None):
+def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, relative_poses_list, K_adjusted_list, T_mc_list, action_list, tracking_3d_list, robot_viz=None, voxel_size=0.01, export_interactive_html=True, image_size=None, follow_camera_view=False):
     """
     sun3d.py 방식을 차용한 nvblox 기반 multiframe 시각화 함수
     - Mapper를 한 번 생성하고 모든 프레임을 순차적으로 처리
     - 각 프레임마다 mesh를 업데이트하여 애니메이션 생성
     - robot_meshes_list가 제공되면 첫 번째 로봇 메시를 씬과 결합
     - export_interactive_html=True이면 interactive HTML로 저장
+    - follow_camera_view=True이면 카메라가 각 프레임의 pose를 따라감
     """
     
     
@@ -2536,9 +2646,19 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, rela
     
     # nvblox Mapper 설정 (sun3d.py 방식)
     projective_integrator_params = ProjectiveIntegratorParams()
-    projective_integrator_params.projective_integrator_max_integration_distance_m = 5.0
+    projective_integrator_params.projective_integrator_max_integration_distance_m = 3.0 # default:5.0
+
+    # dscho NOTE: for debug (to remove tiny mesh)
+    mesh_param = MeshIntegratorParams()
+    mesh_param.mesh_integrator_min_weight = 1.0 # default 1e-4
+    
+
     mapper_params = MapperParams()
     mapper_params.set_projective_integrator_params(projective_integrator_params)
+    mapper_params.set_mesh_integrator_params(mesh_param)
+
+
+
     
     # Mapper 생성
     mapper = Mapper(
@@ -2549,9 +2669,13 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, rela
     from nvblox_torch.examples.utils.feature_extraction import RadioFeatureExtractor
 
     
-    # CustomVisualizerV3 사용
+    # CustomVisualizerV3 사용 (비디오 저장 활성화)
+    video_path = os.path.join(save_path, "nvblox_visualization.mp4")
     visualizer = CustomVisualizerV3(
-        deep_feature_embedding_dim=RadioFeatureExtractor().embedding_dim()
+        deep_feature_embedding_dim=RadioFeatureExtractor().embedding_dim(),
+        video_save=True,
+        video_path=video_path,
+        follow_camera_view=follow_camera_view
     )
     frames = []
     
@@ -2562,6 +2686,14 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, rela
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     from transforms3d.quaternions import quat2mat
+
+    # 첫 번째 프레임의 카메라 포즈를 초기 뷰로 설정 (follow_camera_view가 False일 때만)
+    if not follow_camera_view and len(relative_poses_list) > 0:
+        first_camera_pose = relative_poses_list[0]
+        visualizer.set_initial_camera_pose(first_camera_pose)
+        print("Set initial camera pose from first frame (static mode)")
+    elif follow_camera_view:
+        print("Camera following mode enabled - camera will follow each frame's pose")
 
     # 각 프레임을 순차적으로 처리 (sun3d.py 방식)
     for frame_idx in range(num_frames):
@@ -2618,7 +2750,53 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, rela
         # 2. 모든 메시를 하나로 결합
         combined_mesh = scene_open3d
 
+        # # dscho NOTE: for debug (only for scene meshes, robot meshes doesn't need to be processed)
+        mesh_postprocess_start = time.time()
+        
+        combined_mesh.remove_duplicated_vertices()
+        combined_mesh.remove_duplicated_triangles()
+        combined_mesh.remove_degenerate_triangles()
+        # combined_mesh.remove_non_manifold_edges()
+        print(f"  In multiframe example, Mesh postprocess time: {time.time() - mesh_postprocess_start:.4f} seconds") #  0.04s
+        
+        
+        triangle_postprocess_start = time.time()
+        
+        # # # 작은 컴포넌트 제거(삼각형 개수 기준) (seems to be more effective for small meshes than the above removing duplicated things)
+        # tri_clusters, cluster_n_tri, _ = combined_mesh.cluster_connected_triangles()
+        # tri_clusters = np.asarray(tri_clusters)
+        # keep = [i for i,cnt in enumerate(cluster_n_tri) if cnt >= 800]  # 임계치 튜닝
+        # mask = np.isin(tri_clusters, keep)
+        # combined_mesh.remove_triangles_by_mask(~mask)
+        # combined_mesh.remove_unreferenced_vertices()
+        
 
+        # # 절대 면적 기준
+        # tri_clusters, cluster_n_tri, cluster_area = combined_mesh.cluster_connected_triangles()
+        # cluster_area = np.asarray(cluster_area)  # 각 군집의 총 면적
+
+        # min_area_m2 = 0.02  # 예: 0.02 m^2 미만 군집은 제거 (장면/스케일에 맞게 조절)
+        # keep_ids = np.where(cluster_area >= min_area_m2)[0]
+
+        # mask = np.isin(tri_clusters, keep_ids)  # 남길 군집 = True
+        # combined_mesh.remove_triangles_by_mask(~mask)
+        # combined_mesh.remove_unreferenced_vertices()
+        
+        # 상대 면적 기준
+        tri_clusters, _, cluster_area = combined_mesh.cluster_connected_triangles()
+        cluster_area = np.asarray(cluster_area)
+
+        largest = float(cluster_area.max()) if len(cluster_area) else 0.0
+        alpha = 0.005   # 예: 최대 군집의 0.5% 미만은 제거
+        abs_floor = 800 * 0.5 * (voxel_size ** 2)  # 안전 바닥(아래 설명)
+        thresh = max(alpha * largest, abs_floor)
+
+        keep_ids = np.where(cluster_area >= thresh)[0]
+        mask = np.isin(tri_clusters, keep_ids)
+        combined_mesh.remove_triangles_by_mask(~mask)
+        combined_mesh.remove_unreferenced_vertices()
+
+        print(f"  In multiframe example, Mesh remove triangles time: {time.time() - triangle_postprocess_start:.4f} seconds") # 0.04s
 
 
         T_B_M = np.array([
@@ -2646,9 +2824,9 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, rela
         # Inverse Kinematics로 조인트 각도 계산
         ik_success = robot_viz.solve_inverse_kinematics(action_se3, gripper_angle=gripper_angle)
         print(f"  IK success: {ik_success}")
-        start = time.time()
+        robot_mesh_start = time.time()
         robot_meshes = robot_viz.get_robot_meshes_in_specified_transform(gripper_angle=gripper_angle, T_target=T_W_B) # np.linalg.inv(T_B_C)
-        print(f"  In multiframe example, Robot meshes time: {time.time() - start:.4f} seconds")
+        print(f"  In multiframe example, Robot meshes time: {time.time() - robot_mesh_start:.4f} seconds")
 
         
         # 3. 각 로봇 링크 메시를 결합
@@ -2664,6 +2842,8 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, rela
         
         visibility_results = np.zeros((tracking_3d.shape[0]), dtype=bool)  # True if visible, False if occluded
         hit_distances = np.zeros((tracking_3d.shape[0]), dtype=np.float64)  # Hit distances for each viewpoint and query point
+
+        
 
         
         mesh_tensor = o3d.t.geometry.TriangleMesh.from_legacy(combined_mesh)
@@ -2718,10 +2898,6 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, rela
                 query_point, viewpoint, viewdirection, K_frame, image_size
             )
             
-            # frustum_visible = is_camera_coordinate_point_in_camera_frustum(
-            #     query_point, K_frame, image_size
-            # )
-            
             # 3. 최종 visibility: LOS 체크와 frustum 체크를 모두 통과해야 함
             final_visible = los_visible and frustum_visible
             
@@ -2734,7 +2910,7 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, rela
             frustum_status = "FRUSTUM_OK" if frustum_visible else "FRUSTUM_OUT"
             final_status = "VISIBLE" if final_visible else "OCCLUDED"
             
-            print(f"      Query {query_idx + 1}: {final_status} (LOS: {los_status}, Frustum: {frustum_status}, hit: {los_hit_distance:.3f}m) query_point: {query_point}")
+            print(f"      Query {query_idx + 1}: {final_status} (LOS: {los_status}, Frustum: {frustum_status}, dist(without offset): {distance:.3f}m, hit: {los_hit_distance:.3f}m) query_point: {query_point}")
             
 
 
@@ -2765,7 +2941,7 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, rela
         
     print(f'Saving mesh at {save_path}')
     mapper.update_color_mesh()
-    mapper.get_color_mesh().save(save_path)
+    mapper.get_color_mesh().save(save_path+'/3d_visualization_animate_multiframe_nvblox.ply')
     
     # Interactive HTML export
     if export_interactive_html and interactive_meshes:
@@ -2798,6 +2974,13 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, rela
             print(f"Camera trajectory data available: {len(camera_poses_for_export)} poses")
         
         print(f"Interactive HTML visualization saved: {threejs_html_path}")
+    
+    # 비디오 저장
+    if visualizer.video_save and len(visualizer.captured_frames) > 0:
+        visualizer.save_video()
+        print(f"Video saved with {len(visualizer.captured_frames)} frames")
+    
+    
             
 
 
@@ -3003,24 +3186,42 @@ def depth_processing(rgb, depth_raw, fake_depth_mask, model, camera):
         # 리사이즈가 필요한 경우 depth만 리사이즈
         if RESIZE:
             vprint(f"Resizing depth from {depth_m_original.shape} to {RESIZE_SIZE}")
-            import cv2
+            
             depth_m = cv2.resize(depth_m_original, RESIZE_SIZE, interpolation=cv2.INTER_LINEAR)
         else:
             depth_m = depth_m_original
         
         vprint(f"Final depth shape: {depth_m.shape}")
     else:
+        additional_depth_preprocess = True # False
+        import cv2
         vprint("Using raw depth data...")
         if USE_FAKE_DEPTH:
             print("Applying fake depth (0) to masked regions...")
+            
+            if additional_depth_preprocess:
+                # 1. 마스크 여유띠(dilate)
+                fake_depth_mask = cv2.dilate(fake_depth_mask.astype(np.uint8), np.ones((3,3), np.uint8), iterations=2).astype(bool)
+                
             depth_raw = apply_fake_depth_to_mask(depth_raw[None], fake_depth_mask[None], FAKE_DEPTH_VALUE)[0]
 
+            if additional_depth_preprocess:
+                # 2. 작은 유효깊이 섬 제거(connected components)
+                valid = np.isfinite(depth_raw) & (depth_raw > 0)
+                cnt, labels, stats, _ = cv2.connectedComponentsWithStats(valid.astype(np.uint8), 8)
+                min_area = 20  # 해상도에 맞춰 조절
+                for i in range(1, cnt):
+                    if stats[i, cv2.CC_STAT_AREA] < min_area:
+                        depth_raw[labels == i] = FAKE_DEPTH_VALUE
+
         if RESIZE:
-            import cv2
+            
             depth_m = cv2.resize(depth_raw, RESIZE_SIZE, interpolation=cv2.INTER_LINEAR)
         else:
             depth_m = depth_raw
     
+    
+
     return depth_m
 
 # ========= 메인 =========
@@ -3523,7 +3724,7 @@ def main():
 
     # Multi-frame scene mesh 애니메이션을 위한 RGB-D 데이터 로드
     vprint("\nLoading multiple frames for multiframe visualization...")
-    num_multiframe_frames = 390  # 디버깅을 위해 매우 적게 설정
+    num_multiframe_frames = 250  # 디버깅을 위해 매우 적게 설정
     rgb_frames_list = []
     depth_frames_list = []
     relative_poses_list = []
@@ -3562,12 +3763,13 @@ def main():
     # NVBlox 방식의 Multi-frame scene mesh 애니메이션 생성 (sun3d.py 방식)
     if len(rgb_frames_list) > 0:
         create_multiframe_nvblox(
-            "visibility_test_output/3d_visualization_animate_multiframe_nvblox.ply",
+            "visibility_test_output",
             rgb_frames_list, depth_frames_list, relative_poses_list, K_adjusted_list, T_mc_list, action_list, tracking_3d_list,
             robot_viz=robot_viz,
             voxel_size=VOXEL_SIZE,
             export_interactive_html=False,  # Interactive HTML export 활성화
             image_size=image_size,
+            follow_camera_view=True,
         )
         vprint("NVBlox multi-frame scene mesh animated visualization saved to: visibility_test_output/3d_visualization_animate_multiframe_nvblox.html")
     else:
