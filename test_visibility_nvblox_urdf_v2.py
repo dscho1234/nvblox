@@ -884,7 +884,7 @@ def rgbd_to_point_cloud(rgb_frame, depth_frame, camera_intrinsics, max_depth=5.0
     point_cloud.points = o3d.utility.Vector3dVector(points_3d)
     point_cloud.colors = o3d.utility.Vector3dVector(colors)
     
-    print(f"Generated point cloud with {len(points_3d)} points from {np.sum(valid_mask)} valid depth pixels")
+    
     
     return point_cloud
 
@@ -956,7 +956,7 @@ class CustomVisualizer(Visualizer):
         - active_camera=True: Use active_camera_pose_list for multiple camera frustum visualization
         - video_save: Enable/disable video recording
         """
-        def __init__(self, deep_feature_embedding_dim=None, video_save=False, video_path="output_video.mp4", follow_camera_view=False, active_camera=False):
+        def __init__(self, deep_feature_embedding_dim=None, video_save=False, video_path="output_video.mp4", follow_camera_view=False, active_camera=False, vis_window=True):
             super().__init__(deep_feature_embedding_dim)
             self.los_geometries = {}  # Store LOS geometries for each visualizer
             self.camera_frustum_geometries = {}  # Store camera frustum geometries for each visualizer
@@ -984,12 +984,22 @@ class CustomVisualizer(Visualizer):
             self.active_camera = active_camera
             self.active_camera_pose_list = None  # Store list of active camera poses
             
+            # Visualization window settings
+            self.vis_window = vis_window  # True: show real-time windows, False: hide windows
+            
         
         def _create_visualizer(self, window_name: str):
             """Create visualizer with custom settings for LOS visualization"""
             
             visualizer = o3d.visualization.VisualizerWithKeyCallback()
-            visualizer.create_window(width=800, height=600, window_name=window_name)
+            
+            if self.vis_window:
+                # 윈도우를 화면에 표시
+                visualizer.create_window(width=800, height=600, window_name=window_name)
+            else:
+                # 윈도우를 숨김 (오프스크린 렌더링)
+                visualizer.create_window(width=800, height=600, window_name=window_name, visible=False)
+            
             visualizer.get_render_option().line_width = 5  # LOS 선을 더 두껍게
             visualizer.get_render_option().point_size = 3
             visualizer.get_render_option().background_color = np.asarray([0, 0, 0])
@@ -1130,7 +1140,7 @@ class CustomVisualizer(Visualizer):
             self.visualizers[name].add_geometry(point_cloud)
             self.visualizers[name].update_renderer()
             
-            print(f"Added point cloud visualization to {name} with {len(point_cloud.points)} points")
+            
         
         def create_multiple_lines_of_sight(self, camera_center, target_points, colors=None):
             """
@@ -1237,8 +1247,7 @@ class CustomVisualizer(Visualizer):
                 self.camera_frustum_geometries[name] = frustum_geometry
                 visualizer.add_geometry(frustum_geometry)
                 
-                print(f"Added camera frustum visualization to {name}")
-        
+                
         def _visualize_current_camera_poses(self, current_camera_pose_list, selected_indices=None):
             """
             current_camera_pose_list의 선택된 인덱스 카메라 frustum만 시각화
@@ -1279,8 +1288,7 @@ class CustomVisualizer(Visualizer):
                         visualizer.add_geometry(frustum_geometry)
                 
                 self.camera_frustum_geometries[name] = current_frustum_geometries
-                print(f"Added {len(current_frustum_geometries)} selected current camera frustum visualizations to {name}")
-        
+                
         def _visualize_active_camera_poses(self, active_camera_pose_list, selected_indices=None):
             """
             active_camera_pose_list의 선택된 인덱스 카메라 frustum만 시각화
@@ -1318,8 +1326,7 @@ class CustomVisualizer(Visualizer):
                         visualizer.add_geometry(frustum_geometry)
                 
                 self.active_camera_frustum_geometries[name] = active_frustum_geometries
-                print(f"Added {len(active_frustum_geometries)} selected active camera frustum visualizations to {name}")
-        
+                
         
         def visualize(self, color_mesh=None, feature_mesh=None, point_cloud=None,camera_pose=None, 
                      query_points=None, visibility_results=None, camera_intrinsics=None, image_size=None,
@@ -1393,7 +1400,7 @@ class CustomVisualizer(Visualizer):
                                 line_set = self.create_multiple_lines_of_sight(current_camera_center, query_points, colors)
                                 self.los_geometries[current_los_key] = line_set
                                 visualizer.add_geometry(line_set)
-                                print(f"Added LOS visualization for current camera {cam_idx} to {name}")
+                                
                 
                 # active_camera 모드인 경우 선택된 active camera들에 대한 LOS 시각화
                 if self.active_camera and self.active_camera_pose_list is not None and len(self.active_camera_pose_list) > 0 and active_visibility_results_dict is not None and selected_indices is not None:
@@ -1421,8 +1428,7 @@ class CustomVisualizer(Visualizer):
                                 active_line_set = self.create_multiple_lines_of_sight(active_camera_center, query_points, active_colors)
                                 self.los_geometries[active_los_key] = active_line_set
                                 visualizer.add_geometry(active_line_set)
-                                print(f"Added LOS visualization for active camera {cam_idx} to {name}")
-                    
+                                
             
             # for name, visualizer in self.visualizers.items():
             #     visualizer.update_renderer()
@@ -1435,12 +1441,12 @@ class CustomVisualizer(Visualizer):
             # 기존 카메라 pose 시각화 (선택된 인덱스만)
             if current_camera_pose_list is not None and selected_indices is not None:
                 self._visualize_current_camera_poses(current_camera_pose_list, selected_indices)
-                print(f"Added {len(selected_indices)} selected current camera frustum visualizations")
+                
             
             # active_camera 모드인 경우 선택된 active camera pose list의 frustum 시각화
             if self.active_camera and self.active_camera_pose_list is not None and selected_indices is not None:
                 self._visualize_active_camera_poses(self.active_camera_pose_list, selected_indices)
-                print(f"Added {len(selected_indices)} selected active camera frustum visualizations")
+                
 
             # Restore views and update
             for name, visualizer in self.visualizers.items():
@@ -1454,15 +1460,15 @@ class CustomVisualizer(Visualizer):
                         if isinstance(first_active_camera_pose, torch.Tensor):
                             first_active_camera_pose = first_active_camera_pose.cpu().numpy()
                         self._set_camera_pose_from_matrix(self.visualizers[name], first_active_camera_pose)
-                        print(f"Updated camera pose for {name} (following first active camera)")
+                        
                     elif self.current_camera_pose is not None:
                         # 기존 방식: 현재 카메라 pose를 follow
                         self._set_camera_pose_from_matrix(self.visualizers[name], self.current_camera_pose)
-                        print(f"Updated camera pose for {name} (following current camera)")
+                        
                 elif self.initial_camera_pose is not None:
                     # Static mode: use initial camera pose
                     self._set_camera_pose_from_matrix(self.visualizers[name], self.initial_camera_pose)
-                    print(f"Set initial camera pose for {name}")
+                    
                 self._update_visualization(visualizer, name)
 
             # Handle pausing
@@ -1641,7 +1647,7 @@ def create_current_camera_pose_list(base_camera_pose, num_cameras=10):
     
     return current_camera_pose_list
 
-def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, depth_frames_wo_fake_depth_list, relative_poses_list, K_adjusted_list, T_mc_list, action_list, tracking_3d_list, robot_viz=None, voxel_size=0.01, image_size=None, follow_camera_view=False, active_camera=False):
+def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, depth_frames_wo_fake_depth_list, relative_poses_list, K_adjusted_list, T_mc_list, action_list, tracking_3d_list, robot_viz=None, voxel_size=0.01, image_size=None, follow_camera_view=False, active_camera=False, vis_window=True):
     """
     sun3d.py 방식을 차용한 nvblox 기반 multiframe 시각화 함수
     - Mapper를 한 번 생성하고 모든 프레임을 순차적으로 처리
@@ -1689,7 +1695,8 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, dept
         video_save=True,
         video_path=video_path,
         follow_camera_view=follow_camera_view,
-        active_camera=active_camera
+        active_camera=active_camera,
+        vis_window=vis_window
     )
     
     # 첫 번째 프레임의 카메라 포즈를 초기 뷰로 설정 (follow_camera_view가 False일 때만)
@@ -1745,10 +1752,9 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, dept
         
         # Inverse Kinematics로 조인트 각도 계산
         ik_success = robot_viz.solve_inverse_kinematics(action_se3, gripper_angle=gripper_angle)
-        print(f"  IK success: {ik_success}")
         robot_mesh_start = time.time()
         robot_meshes = robot_viz.get_robot_meshes_in_specified_transform(gripper_angle=gripper_angle, T_target=T_W_B) # np.linalg.inv(T_B_C)
-        print(f"  In multiframe example, Robot meshes time: {time.time() - robot_mesh_start:.4f} seconds")
+        print(f" IK success: {ik_success}, In multiframe example, Robot meshes time: {time.time() - robot_mesh_start:.4f} seconds")
 
         
         # 3. 각 로봇 링크 메시를 결합
@@ -1785,14 +1791,11 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, dept
         
         # 기존 카메라 pose list 생성 (현재 카메라 pose 복사)
         current_camera_pose_list = create_current_camera_pose_list(current_camera_pose_np, num_cameras=10)
-        print(f"Generated {len(current_camera_pose_list)} current camera poses")
+        
         
         # 선택된 인덱스 정의 (카메라 리스트 길이에 관계없이 고정)
         selected_indices = [0, 5, 9]  # 고정된 인덱스 사용
         selected_indices = sorted(list(set(selected_indices)))
-        
-        # 기존 카메라에 대한 visibility 계산 (선택된 인덱스만)
-        print(f"Computing visibility for current cameras at indices: {selected_indices}")
         
         # 각 선택된 기존 카메라에 대한 visibility 계산
         current_visibility_results_dict = {}
@@ -1803,7 +1806,7 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, dept
                 current_viewpoint = current_camera_pose[:3, 3]
                 current_viewdirection = R.from_matrix(current_camera_pose[:3, :3]).as_euler('xyz', degrees=True)
                 
-                print(f"Computing visibility for current camera {cam_idx} at: {current_viewpoint}")
+                
                 
                 # 현재 카메라에 대한 visibility 계산
                 current_visibility_results = np.zeros((tracking_3d.shape[0]), dtype=bool)
@@ -1845,11 +1848,11 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, dept
                     frustum_status = "FRUSTUM_OK" if frustum_visible else "FRUSTUM_OUT"
                     final_status = "VISIBLE" if final_visible else "OCCLUDED"
                     
-                    print(f"      Current Camera {cam_idx} Query {query_idx + 1}: {final_status} (LOS: {los_status}, Frustum: {frustum_status}, dist(without offset): {distance:.3f}m, hit: {los_hit_distance:.3f}m) query_point: {query_point}")
+                    vprint(f"      Current Camera {cam_idx} Query {query_idx + 1}: {final_status} (LOS: {los_status}, Frustum: {frustum_status}, dist(without offset): {distance:.3f}m, hit: {los_hit_distance:.3f}m) query_point: {query_point}")
                 
                 # 결과를 딕셔너리에 저장
                 current_visibility_results_dict[cam_idx] = current_visibility_results
-                print(f"Current camera {cam_idx} visibility results: {np.sum(current_visibility_results)}/{len(current_visibility_results)} points visible")
+                vprint(f"Current camera {cam_idx} visibility results: {np.sum(current_visibility_results)}/{len(current_visibility_results)} points visible")
         
         # 첫 번째 선택된 카메라의 결과를 기본 visibility_results로 설정 (기존 코드 호환성)
         if selected_indices:
@@ -1880,7 +1883,7 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, dept
             point_cloud.points = o3d.utility.Vector3dVector(points_world)
             point_cloud.colors = o3d.utility.Vector3dVector(colors)
             
-            print(f"Transformed point cloud from camera to world coordinates: {len(points_world)} points")
+            
         else:
             point_cloud = point_cloud_camera
         
@@ -1889,11 +1892,11 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, dept
         if active_camera:
             # 현재 카메라 pose를 기준으로 active_camera_pose_list 생성
             active_camera_pose_list = create_active_camera_pose_list(current_camera_pose_np, num_cameras=10, translation_step=-0.05)
-            print(f"Generated {len(active_camera_pose_list)} active camera poses")
+            
             
             # 지정된 인덱스의 active camera들에 대한 visibility 계산 (기존 카메라와 동일한 인덱스 사용)
             if len(active_camera_pose_list) > 0:
-                print(f"Computing visibility for active cameras at indices: {selected_indices}")
+                
                 
                 # 각 선택된 active camera에 대한 visibility 계산
                 active_visibility_results_dict = {}
@@ -1904,7 +1907,7 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, dept
                         active_viewpoint = active_camera_pose[:3, 3]
                         active_viewdirection = R.from_matrix(active_camera_pose[:3, :3]).as_euler('xyz', degrees=True)
                         
-                        print(f"Computing visibility for active camera {cam_idx} at: {active_viewpoint}")
+                        
                         
                         # 현재 active camera에 대한 visibility 계산
                         current_visibility_results = np.zeros((tracking_3d.shape[0]), dtype=bool)
@@ -1946,11 +1949,11 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, dept
                             frustum_status = "FRUSTUM_OK" if frustum_visible else "FRUSTUM_OUT"
                             final_status = "VISIBLE" if final_visible else "OCCLUDED"
                             
-                            print(f"      Active Camera {cam_idx} Query {query_idx + 1}: {final_status} (LOS: {los_status}, Frustum: {frustum_status}, dist(without offset): {distance:.3f}m, hit: {los_hit_distance:.3f}m) query_point: {query_point}")
+                            vprint(f"      Active Camera {cam_idx} Query {query_idx + 1}: {final_status} (LOS: {los_status}, Frustum: {frustum_status}, dist(without offset): {distance:.3f}m, hit: {los_hit_distance:.3f}m) query_point: {query_point}")
                         
                         # 결과를 딕셔너리에 저장
                         active_visibility_results_dict[cam_idx] = current_visibility_results
-                        print(f"Active camera {cam_idx} visibility results: {np.sum(current_visibility_results)}/{len(current_visibility_results)} points visible")
+                        vprint(f"Active camera {cam_idx} visibility results: {np.sum(current_visibility_results)}/{len(current_visibility_results)} points visible")
                 
                 
         
@@ -2168,6 +2171,7 @@ def main():
             image_size=image_size,
             follow_camera_view=True,
             active_camera=True,  # active_camera 모드 활성화
+            vis_window=False,  # 윈도우 숨김 (비디오만 저장)
         )
         vprint("NVBlox multi-frame scene mesh animated visualization saved to: visibility_test_output/3d_visualization_animate_multiframe_nvblox.html")
     else:
