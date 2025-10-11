@@ -952,12 +952,15 @@ class CustomVisualizer(Visualizer):
         Camera Control:
         - follow_camera_view=False: Static camera view (uses initial camera pose)
         - follow_camera_view=True: Dynamic camera view (follows each frame's camera pose)
+        - active_camera=False: Use current camera pose for visualization
+        - active_camera=True: Use active_camera_pose_list for multiple camera frustum visualization
         - video_save: Enable/disable video recording
         """
-        def __init__(self, deep_feature_embedding_dim=None, video_save=False, video_path="output_video.mp4", follow_camera_view=False):
+        def __init__(self, deep_feature_embedding_dim=None, video_save=False, video_path="output_video.mp4", follow_camera_view=False, active_camera=False):
             super().__init__(deep_feature_embedding_dim)
             self.los_geometries = {}  # Store LOS geometries for each visualizer
             self.camera_frustum_geometries = {}  # Store camera frustum geometries for each visualizer
+            self.active_camera_frustum_geometries = {}  # Store active camera frustum geometries for each visualizer
             self.query_points = None
             self.camera_center = None
             self.visibility_results = None
@@ -976,6 +979,10 @@ class CustomVisualizer(Visualizer):
             self.follow_camera_view = follow_camera_view
             self.current_camera_pose = None  # Store current camera pose for following
             self.visualizers = {}
+            
+            # Active camera settings
+            self.active_camera = active_camera
+            self.active_camera_pose_list = None  # Store list of active camera poses
             
         
         def _create_visualizer(self, window_name: str):
@@ -1158,24 +1165,29 @@ class CustomVisualizer(Visualizer):
             
             return line_set
         
-        def create_camera_frustum_geometry(self, camera_pose, camera_intrinsics, image_size, max_distance=0.5):
+        def create_camera_frustum_geometry(self, camera_pose, camera_intrinsics, image_size, max_distance=0.2, color=None):
             """
             카메라 frustum을 Open3D geometry로 생성
             
             Args:
-                camera_pose: 카메라 pose (4x4 변환 행렬)
+                camera_pose: 카메라 pose (4x4 변환 행렬, torch.Tensor 또는 numpy.ndarray)
                 camera_intrinsics: 카메라 내부 파라미터 (3x3)
                 image_size: 이미지 크기 (width, height)
                 max_distance: frustum의 최대 거리
+                color: frustum 색상 [R, G, B] (None이면 기본 색상 사용)
             
             Returns:
                 o3d.geometry.LineSet: 카메라 frustum을 나타내는 LineSet
             """
             
             
-            # 카메라 위치와 회전 추출
-            camera_position = camera_pose[:3, 3].cpu().numpy()
-            camera_rotation_matrix = camera_pose[:3, :3].cpu().numpy()
+            # 카메라 위치와 회전 추출 (torch.Tensor 또는 numpy.ndarray 모두 지원)
+            if isinstance(camera_pose, torch.Tensor):
+                camera_position = camera_pose[:3, 3].cpu().numpy()
+                camera_rotation_matrix = camera_pose[:3, :3].cpu().numpy()
+            else:
+                camera_position = camera_pose[:3, 3]
+                camera_rotation_matrix = camera_pose[:3, :3]
             camera_rotation_rpy = R.from_matrix(camera_rotation_matrix).as_euler('xyz', degrees=True)
             
             # frustum 꼭짓점 생성
@@ -1196,7 +1208,11 @@ class CustomVisualizer(Visualizer):
             line_set = o3d.geometry.LineSet()
             line_set.points = o3d.utility.Vector3dVector(points)
             line_set.lines = o3d.utility.Vector2iVector(np.array(lines))
-            line_set.colors = o3d.utility.Vector3dVector(np.array([[0, 1, 1]] * len(lines)))  # 청록색
+            
+            # 색상 설정 (기본값: 청록색, 지정된 색상이 있으면 사용)
+            if color is None:
+                color = [0, 1, 1]  # 청록색 (기본)
+            line_set.colors = o3d.utility.Vector3dVector(np.array([color] * len(lines)))
             
             return line_set
         
@@ -1223,9 +1239,93 @@ class CustomVisualizer(Visualizer):
                 
                 print(f"Added camera frustum visualization to {name}")
         
+        def _visualize_current_camera_poses(self, current_camera_pose_list, selected_indices=None):
+            """
+            current_camera_pose_list의 선택된 인덱스 카메라 frustum만 시각화
+            """
+            if self.camera_intrinsics is None or self.image_size is None:
+                print("Warning: Camera intrinsics or image size not set, skipping current camera frustum visualization")
+                return
+            
+            if current_camera_pose_list is None or len(current_camera_pose_list) == 0:
+                print("Warning: No current camera poses provided")
+                return
+            
+            # 선택된 인덱스가 없으면 모든 인덱스 사용
+            if selected_indices is None:
+                selected_indices = list(range(len(current_camera_pose_list)))
+            
+            # 모든 visualizer에 선택된 current camera frustum들만 추가
+            for name, visualizer in self.visualizers.items():
+                # 기존 current camera frustum geometries 제거
+                if name in self.camera_frustum_geometries:
+                    if isinstance(self.camera_frustum_geometries[name], list):
+                        for geometry in self.camera_frustum_geometries[name]:
+                            visualizer.remove_geometry(geometry)
+                    else:
+                        visualizer.remove_geometry(self.camera_frustum_geometries[name])
+                    self.camera_frustum_geometries[name] = []
+                
+                # 선택된 current camera pose들에 대해서만 frustum 생성 및 추가
+                current_frustum_geometries = []
+                for i in selected_indices:
+                    if i < len(current_camera_pose_list):
+                        camera_pose = current_camera_pose_list[i]
+                        # current camera는 청록색으로 표시 (기본 색상)
+                        frustum_geometry = self.create_camera_frustum_geometry(
+                            camera_pose, self.camera_intrinsics, self.image_size, color=[0, 1, 1]  # 청록색
+                        )
+                        current_frustum_geometries.append(frustum_geometry)
+                        visualizer.add_geometry(frustum_geometry)
+                
+                self.camera_frustum_geometries[name] = current_frustum_geometries
+                print(f"Added {len(current_frustum_geometries)} selected current camera frustum visualizations to {name}")
+        
+        def _visualize_active_camera_poses(self, active_camera_pose_list, selected_indices=None):
+            """
+            active_camera_pose_list의 선택된 인덱스 카메라 frustum만 시각화
+            """
+            if self.camera_intrinsics is None or self.image_size is None:
+                print("Warning: Camera intrinsics or image size not set, skipping active camera frustum visualization")
+                return
+            
+            if active_camera_pose_list is None or len(active_camera_pose_list) == 0:
+                print("Warning: No active camera poses provided")
+                return
+            
+            # 선택된 인덱스가 없으면 모든 인덱스 사용
+            if selected_indices is None:
+                selected_indices = list(range(len(active_camera_pose_list)))
+            
+            # 모든 visualizer에 선택된 active camera frustum들만 추가
+            for name, visualizer in self.visualizers.items():
+                # 기존 active camera frustum geometries 제거
+                if name in self.active_camera_frustum_geometries:
+                    for geometry in self.active_camera_frustum_geometries[name]:
+                        visualizer.remove_geometry(geometry)
+                    self.active_camera_frustum_geometries[name] = []
+                
+                # 선택된 active camera pose들에 대해서만 frustum 생성 및 추가
+                active_frustum_geometries = []
+                for i in selected_indices:
+                    if i < len(active_camera_pose_list):
+                        camera_pose = active_camera_pose_list[i]
+                        # active camera는 노란색으로 표시 (기존 카메라와 구분)
+                        frustum_geometry = self.create_camera_frustum_geometry(
+                            camera_pose, self.camera_intrinsics, self.image_size, color=[1, 1, 0]  # 노란색
+                        )
+                        active_frustum_geometries.append(frustum_geometry)
+                        visualizer.add_geometry(frustum_geometry)
+                
+                self.active_camera_frustum_geometries[name] = active_frustum_geometries
+                print(f"Added {len(active_frustum_geometries)} selected active camera frustum visualizations to {name}")
+        
         
         def visualize(self, color_mesh=None, feature_mesh=None, point_cloud=None,camera_pose=None, 
-                     query_points=None, visibility_results=None, camera_intrinsics=None, image_size=None):
+                     query_points=None, visibility_results=None, camera_intrinsics=None, image_size=None,
+                     current_camera_pose_list=None, current_visibility_results_dict=None,
+                     active_camera_pose_list=None, active_visibility_results_dict=None,
+                     selected_indices=None):
             """
             LOS를 포함한 시각화 (원래 visualize 함수 오버라이드)
             
@@ -1237,12 +1337,21 @@ class CustomVisualizer(Visualizer):
                 visibility_results: Visibility results for each query point (옵션)
                 camera_intrinsics: Camera intrinsics for frustum visualization (옵션)
                 image_size: Image size for frustum visualization (옵션)
+                current_camera_pose_list: List of current camera poses (옵션)
+                current_visibility_results_dict: Dictionary of visibility results for multiple current cameras (옵션)
+                active_camera_pose_list: List of active camera poses for multiple frustum visualization (옵션)
+                active_visibility_results_dict: Dictionary of visibility results for multiple active cameras (옵션)
+                selected_indices: List of selected indices for visualization (옵션)
             """
             # Store camera intrinsics and image size for frustum visualization
             if camera_intrinsics is not None:
                 self.camera_intrinsics = camera_intrinsics
             if image_size is not None:
                 self.image_size = image_size
+            
+            # Store active camera pose list
+            if active_camera_pose_list is not None:
+                self.active_camera_pose_list = active_camera_pose_list
             
             # Update current camera pose if following mode is enabled
             if self.follow_camera_view and camera_pose is not None:
@@ -1258,28 +1367,61 @@ class CustomVisualizer(Visualizer):
 
             
             # LOS 시각화 추가 (query_points와 visibility_results가 제공된 경우)
-            if query_points is not None and camera_pose is not None and visibility_results is not None:
-                # 카메라 중심 추출 (camera_pose는 4x4 변환 행렬)
-                camera_center = camera_pose[:3, 3].cpu().numpy()
+            if query_points is not None and visibility_results is not None:
+                # 기존 카메라의 LOS 시각화 (선택된 인덱스만)
+                if current_camera_pose_list is not None and current_visibility_results_dict is not None and selected_indices is not None:
+                    for name, visualizer in self.visualizers.items():
+                        for cam_idx, cam_visibility_results in current_visibility_results_dict.items():
+                            if cam_idx in selected_indices and cam_idx < len(current_camera_pose_list):
+                                current_camera_pose = current_camera_pose_list[cam_idx]
+                                current_camera_center = current_camera_pose[:3, 3].cpu().numpy() if isinstance(current_camera_pose, torch.Tensor) else current_camera_pose[:3, 3]
+                                
+                                # 기존 카메라 LOS geometry 제거
+                                current_los_key = f"{name}_current_los_{cam_idx}"
+                                if current_los_key in self.los_geometries:
+                                    visualizer.remove_geometry(self.los_geometries[current_los_key])
+                                
+                                # 가시성에 따른 색깔 결정 (기존 카메라: 초록/빨강)
+                                colors = []
+                                for visible in cam_visibility_results:
+                                    if visible:
+                                        colors.append([0, 1, 0])  # 초록색 (visible)
+                                    else:
+                                        colors.append([1, 0, 0])  # 빨간색 (occluded)
+                                
+                                # LOS 생성 및 추가
+                                line_set = self.create_multiple_lines_of_sight(current_camera_center, query_points, colors)
+                                self.los_geometries[current_los_key] = line_set
+                                visualizer.add_geometry(line_set)
+                                print(f"Added LOS visualization for current camera {cam_idx} to {name}")
                 
-                # LOS를 기존 visualizer에 직접 추가
-                for name, visualizer in self.visualizers.items():
-                    # 기존 LOS geometry 제거
-                    if name in self.los_geometries:
-                        visualizer.remove_geometry(self.los_geometries[name])
-                    
-                    # 가시성에 따른 색깔 결정
-                    colors = []
-                    for visible in visibility_results:
-                        if visible:
-                            colors.append([0, 1, 0])  # 초록색 (visible)
-                        else:
-                            colors.append([1, 0, 0])  # 빨간색 (occluded)
-                    
-                    # LOS 생성 및 추가
-                    line_set = self.create_multiple_lines_of_sight(camera_center, query_points, colors)
-                    self.los_geometries[name] = line_set
-                    visualizer.add_geometry(line_set)
+                # active_camera 모드인 경우 선택된 active camera들에 대한 LOS 시각화
+                if self.active_camera and self.active_camera_pose_list is not None and len(self.active_camera_pose_list) > 0 and active_visibility_results_dict is not None and selected_indices is not None:
+                    # 각 선택된 active camera에 대해 LOS 시각화
+                    for name, visualizer in self.visualizers.items():
+                        for cam_idx, cam_visibility_results in active_visibility_results_dict.items():
+                            if cam_idx in selected_indices and cam_idx < len(self.active_camera_pose_list):
+                                active_camera_pose = self.active_camera_pose_list[cam_idx]
+                                active_camera_center = active_camera_pose[:3, 3].cpu().numpy() if isinstance(active_camera_pose, torch.Tensor) else active_camera_pose[:3, 3]
+                                
+                                # active camera LOS geometry 제거
+                                active_los_key = f"{name}_active_los_{cam_idx}"
+                                if active_los_key in self.los_geometries:
+                                    visualizer.remove_geometry(self.los_geometries[active_los_key])
+                                
+                                # active camera용 가시성에 따른 색깔 결정 (기존과 동일: 초록/빨강)
+                                active_colors = []
+                                for visible in cam_visibility_results:
+                                    if visible:
+                                        active_colors.append([0, 1, 0])  # 초록색 (visible)
+                                    else:
+                                        active_colors.append([1, 0, 0])  # 빨간색 (occluded)
+                                
+                                # active camera LOS 생성 및 추가
+                                active_line_set = self.create_multiple_lines_of_sight(active_camera_center, query_points, active_colors)
+                                self.los_geometries[active_los_key] = active_line_set
+                                visualizer.add_geometry(active_line_set)
+                                print(f"Added LOS visualization for active camera {cam_idx} to {name}")
                     
             
             # for name, visualizer in self.visualizers.items():
@@ -1289,17 +1431,34 @@ class CustomVisualizer(Visualizer):
             if feature_mesh is not None:
                 self._visualize_nvblox_feature_mesh(feature_mesh)
 
-            if camera_pose is not None:
-                self._visualize_camera_pose(camera_pose)
+            # 카메라 frustum 시각화
+            # 기존 카메라 pose 시각화 (선택된 인덱스만)
+            if current_camera_pose_list is not None and selected_indices is not None:
+                self._visualize_current_camera_poses(current_camera_pose_list, selected_indices)
+                print(f"Added {len(selected_indices)} selected current camera frustum visualizations")
+            
+            # active_camera 모드인 경우 선택된 active camera pose list의 frustum 시각화
+            if self.active_camera and self.active_camera_pose_list is not None and selected_indices is not None:
+                self._visualize_active_camera_poses(self.active_camera_pose_list, selected_indices)
+                print(f"Added {len(selected_indices)} selected active camera frustum visualizations")
 
             # Restore views and update
             for name, visualizer in self.visualizers.items():
                 if name in self.pending_camera_updates:
                     visualizer.set_view_status(self.pending_camera_updates[name]['view_status'])
-                elif self.follow_camera_view and self.current_camera_pose is not None:
-                    # Follow camera mode: update camera pose to current pose
-                    self._set_camera_pose_from_matrix(self.visualizers[name], self.current_camera_pose)
-                    print(f"Updated camera pose for {name} (following mode)")
+                elif self.follow_camera_view:
+                    # Follow camera mode: determine which camera to follow
+                    if self.active_camera and self.active_camera_pose_list is not None and len(self.active_camera_pose_list) > 0:
+                        # active_camera 모드: 첫 번째 active camera를 follow (인덱스 0)
+                        first_active_camera_pose = self.active_camera_pose_list[0]
+                        if isinstance(first_active_camera_pose, torch.Tensor):
+                            first_active_camera_pose = first_active_camera_pose.cpu().numpy()
+                        self._set_camera_pose_from_matrix(self.visualizers[name], first_active_camera_pose)
+                        print(f"Updated camera pose for {name} (following first active camera)")
+                    elif self.current_camera_pose is not None:
+                        # 기존 방식: 현재 카메라 pose를 follow
+                        self._set_camera_pose_from_matrix(self.visualizers[name], self.current_camera_pose)
+                        print(f"Updated camera pose for {name} (following current camera)")
                 elif self.initial_camera_pose is not None:
                     # Static mode: use initial camera pose
                     self._set_camera_pose_from_matrix(self.visualizers[name], self.initial_camera_pose)
@@ -1355,13 +1514,139 @@ class CustomVisualizer(Visualizer):
             print(f"Total {video_type} frames: {len(frames)}")
             
 
-def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, depth_frames_wo_fake_depth_list, relative_poses_list, K_adjusted_list, T_mc_list, action_list, tracking_3d_list, fake_depth_masks_resized_list=None, robot_viz=None, voxel_size=0.01, export_interactive_html=True, image_size=None, follow_camera_view=False):
+def get_scene_mesh(rgb_frame, depth_frame, K_frame, relative_pose, voxel_size, mapper):
+    # Depth 이미지를 torch tensor로 변환 (GPU)
+    depth_tensor = torch.from_numpy(depth_frame.astype(np.float32)).cuda()
+    
+    # RGB 이미지를 torch tensor로 변환 (GPU)
+    rgb_tensor = torch.from_numpy(rgb_frame).cuda()
+    
+    # 카메라 내부 파라미터를 torch tensor로 변환 (CPU)
+    intrinsics_tensor = torch.from_numpy(K_frame.astype(np.float32)).cpu()
+    
+    # 카메라 포즈
+    if relative_pose is None:
+        pose_tensor = torch.eye(4, dtype=torch.float32).cpu()
+    else:
+        pose_tensor = torch.from_numpy(relative_pose).float().cpu()
+    
+    # nvblox에 데이터 추가 (sun3d.py 방식)
+    mapper.add_depth_frame(depth_tensor, pose_tensor, intrinsics_tensor)
+    mapper.add_color_frame(rgb_tensor, pose_tensor, intrinsics_tensor)
+    
+    # 메시 업데이트 (각 프레임마다)
+    mapper.update_color_mesh()
+    color_mesh = mapper.get_color_mesh()
+    
+    # nvblox ColorMesh
+    scene_open3d = color_mesh.to_open3d()
+    
+    
+    
+    scene_mesh = scene_open3d
+
+    # # dscho NOTE: for debug (only for scene meshes, robot meshes doesn't need to be processed)
+    mesh_postprocess_start = time.time()
+    
+    scene_mesh.remove_duplicated_vertices()
+    scene_mesh.remove_duplicated_triangles()
+    scene_mesh.remove_degenerate_triangles()
+    # scene_mesh.remove_non_manifold_edges()
+    print(f"  In multiframe example, Mesh postprocess time: {time.time() - mesh_postprocess_start:.4f} seconds") #  0.04s
+    
+    
+    triangle_postprocess_start = time.time()
+    
+    # # # 작은 컴포넌트 제거(삼각형 개수 기준) (seems to be more effective for small meshes than the above removing duplicated things)
+    # tri_clusters, cluster_n_tri, _ = scene_mesh.cluster_connected_triangles()
+    # tri_clusters = np.asarray(tri_clusters)
+    # keep = [i for i,cnt in enumerate(cluster_n_tri) if cnt >= 800]  # 임계치 튜닝
+    # mask = np.isin(tri_clusters, keep)
+    # scene_mesh.remove_triangles_by_mask(~mask)
+    # scene_mesh.remove_unreferenced_vertices()
+    
+
+    # # 절대 면적 기준
+    # tri_clusters, cluster_n_tri, cluster_area = scene_mesh.cluster_connected_triangles()
+    # cluster_area = np.asarray(cluster_area)  # 각 군집의 총 면적
+
+    # min_area_m2 = 0.02  # 예: 0.02 m^2 미만 군집은 제거 (장면/스케일에 맞게 조절)
+    # keep_ids = np.where(cluster_area >= min_area_m2)[0]
+
+    # mask = np.isin(tri_clusters, keep_ids)  # 남길 군집 = True
+    # scene_mesh.remove_triangles_by_mask(~mask)
+    # scene_mesh.remove_unreferenced_vertices()
+    
+    # 상대 면적 기준
+    tri_clusters, _, cluster_area = scene_mesh.cluster_connected_triangles()
+    cluster_area = np.asarray(cluster_area)
+
+    largest = float(cluster_area.max()) if len(cluster_area) else 0.0
+    alpha = 0.005   # 예: 최대 군집의 0.5% 미만은 제거
+    abs_floor = 800 * 0.5 * (voxel_size ** 2)  # 안전 바닥(아래 설명)
+    thresh = max(alpha * largest, abs_floor)
+
+    keep_ids = np.where(cluster_area >= thresh)[0]
+    mask = np.isin(tri_clusters, keep_ids)
+    scene_mesh.remove_triangles_by_mask(~mask)
+    scene_mesh.remove_unreferenced_vertices()
+
+    print(f"  In multiframe example, Mesh remove triangles time: {time.time() - triangle_postprocess_start:.4f} seconds") # 0.04s
+    return scene_mesh, pose_tensor
+
+    
+
+def create_active_camera_pose_list(base_camera_pose, num_cameras=10, translation_step=-0.05):
+    """
+    현재 카메라 pose에서 y방향으로 translation_step씩 이동한 카메라 pose 리스트 생성
+    
+    Args:
+        base_camera_pose: 기준 카메라 pose (4x4 변환 행렬)
+        num_cameras: 생성할 카메라 개수
+        translation_step: y방향 이동 거리 (미터)
+    
+    Returns:
+        active_camera_pose_list: 생성된 카메라 pose 리스트
+    """
+    active_camera_pose_list = []
+    
+    for i in range(num_cameras):
+        # 기준 카메라 pose 복사
+        camera_pose = base_camera_pose.copy()
+        
+        # y방향으로 translation_step * (i+1)만큼 이동
+        camera_pose[1, 3] += translation_step * (i+1)
+        
+        active_camera_pose_list.append(camera_pose)
+    
+    return active_camera_pose_list
+
+def create_current_camera_pose_list(base_camera_pose, num_cameras=10):
+    """
+    현재 카메라 pose를 복사한 카메라 pose 리스트 생성 (translation 없이)
+    
+    Args:
+        base_camera_pose: 기준 카메라 pose (4x4 변환 행렬)
+        num_cameras: 생성할 카메라 개수
+    
+    Returns:
+        current_camera_pose_list: 생성된 카메라 pose 리스트
+    """
+    current_camera_pose_list = []
+    
+    for i in range(num_cameras):
+        # 기준 카메라 pose 복사 (translation 없이)
+        camera_pose = base_camera_pose.copy()
+        current_camera_pose_list.append(camera_pose)
+    
+    return current_camera_pose_list
+
+def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, depth_frames_wo_fake_depth_list, relative_poses_list, K_adjusted_list, T_mc_list, action_list, tracking_3d_list, robot_viz=None, voxel_size=0.01, image_size=None, follow_camera_view=False, active_camera=False):
     """
     sun3d.py 방식을 차용한 nvblox 기반 multiframe 시각화 함수
     - Mapper를 한 번 생성하고 모든 프레임을 순차적으로 처리
     - 각 프레임마다 mesh를 업데이트하여 애니메이션 생성
     - robot_meshes_list가 제공되면 첫 번째 로봇 메시를 씬과 결합
-    - export_interactive_html=True이면 interactive HTML로 저장
     - follow_camera_view=True이면 카메라가 각 프레임의 pose를 따라감
     """
     
@@ -1396,25 +1681,17 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, dept
         mapper_parameters=mapper_params,
     )
     
-    from nvblox_torch.examples.utils.feature_extraction import RadioFeatureExtractor
+    
 
     
     video_path = os.path.join(save_path, "nvblox_visualization.mp4")
     visualizer = CustomVisualizer(
         video_save=True,
         video_path=video_path,
-        follow_camera_view=follow_camera_view
+        follow_camera_view=follow_camera_view,
+        active_camera=active_camera
     )
-    frames = []
     
-    # Interactive HTML export를 위한 mesh 저장 리스트
-    interactive_meshes = []
-    camera_poses_for_export = []
-    
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    from transforms3d.quaternions import quat2mat
-
     # 첫 번째 프레임의 카메라 포즈를 초기 뷰로 설정 (follow_camera_view가 False일 때만)
     if not follow_camera_view and len(relative_poses_list) > 0:
         first_camera_pose = relative_poses_list[0]
@@ -1435,104 +1712,27 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, dept
         K_frame = K_adjusted_list[frame_idx]
         relative_pose = relative_poses_list[frame_idx]
         T_mc = T_mc_list[frame_idx]
-        action = action_list[frame_idx] # [7]
+        action = action_list[frame_idx] # [7], camera coordinate
+        tracking_3d = tracking_3d_list[frame_idx] # [N, 3]
+        T_mw = T_mc_list[0].copy()
+        T_W_B = np.linalg.inv(T_B_M @ T_mw)
+        T_B_C = T_B_M @ T_mc
+
+        
+        
+        scene_mesh, pose_tensor = get_scene_mesh(rgb_frame, depth_frame, K_frame, relative_pose, voxel_size, mapper)
+
+        # action should be robot's base coordinate
         action_se3 = np.eye(4)
         action_se3[:3, 3] = action[:3]
         # action_se3[:3, 3] = np.array([0.7, 0.05, 0.15]) # NOTE: dscho debug (straight forward configuration)
         action_se3[:3, :3] = R.from_euler('xyz', action[3:6], degrees=False).as_matrix()
         gripper_action = action[6]
-        tracking_3d = tracking_3d_list[frame_idx] # [N, 3]
-        
-        
 
-        # 데이터를 torch tensor로 변환
-        H, W = depth_frame.shape
+        # convert to robot's base coordinate if action is in camera coordinate   
+        if T_B_C is not None:
+            action_se3 = T_B_C @ action_se3
         
-        # Depth 이미지를 torch tensor로 변환 (GPU)
-        depth_tensor = torch.from_numpy(depth_frame.astype(np.float32)).cuda()
-        
-        # RGB 이미지를 torch tensor로 변환 (GPU)
-        rgb_tensor = torch.from_numpy(rgb_frame).cuda()
-        
-        # 카메라 내부 파라미터를 torch tensor로 변환 (CPU)
-        intrinsics_tensor = torch.from_numpy(K_frame.astype(np.float32)).cpu()
-        
-        # 카메라 포즈
-        if relative_pose is None:
-            pose_tensor = torch.eye(4, dtype=torch.float32).cpu()
-        else:
-            pose_tensor = torch.from_numpy(relative_pose).float().cpu()
-        
-        # nvblox에 데이터 추가 (sun3d.py 방식)
-        mapper.add_depth_frame(depth_tensor, pose_tensor, intrinsics_tensor)
-        mapper.add_color_frame(rgb_tensor, pose_tensor, intrinsics_tensor)
-        
-        # 메시 업데이트 (각 프레임마다)
-        mapper.update_color_mesh()
-        color_mesh = mapper.get_color_mesh()
-        
-        # nvblox ColorMesh
-        scene_open3d = color_mesh.to_open3d()
-        
-        
-        # 2. 모든 메시를 하나로 결합
-        combined_mesh = scene_open3d
-
-        # # dscho NOTE: for debug (only for scene meshes, robot meshes doesn't need to be processed)
-        mesh_postprocess_start = time.time()
-        
-        combined_mesh.remove_duplicated_vertices()
-        combined_mesh.remove_duplicated_triangles()
-        combined_mesh.remove_degenerate_triangles()
-        # combined_mesh.remove_non_manifold_edges()
-        print(f"  In multiframe example, Mesh postprocess time: {time.time() - mesh_postprocess_start:.4f} seconds") #  0.04s
-        
-        
-        triangle_postprocess_start = time.time()
-        
-        # # # 작은 컴포넌트 제거(삼각형 개수 기준) (seems to be more effective for small meshes than the above removing duplicated things)
-        # tri_clusters, cluster_n_tri, _ = combined_mesh.cluster_connected_triangles()
-        # tri_clusters = np.asarray(tri_clusters)
-        # keep = [i for i,cnt in enumerate(cluster_n_tri) if cnt >= 800]  # 임계치 튜닝
-        # mask = np.isin(tri_clusters, keep)
-        # combined_mesh.remove_triangles_by_mask(~mask)
-        # combined_mesh.remove_unreferenced_vertices()
-        
-
-        # # 절대 면적 기준
-        # tri_clusters, cluster_n_tri, cluster_area = combined_mesh.cluster_connected_triangles()
-        # cluster_area = np.asarray(cluster_area)  # 각 군집의 총 면적
-
-        # min_area_m2 = 0.02  # 예: 0.02 m^2 미만 군집은 제거 (장면/스케일에 맞게 조절)
-        # keep_ids = np.where(cluster_area >= min_area_m2)[0]
-
-        # mask = np.isin(tri_clusters, keep_ids)  # 남길 군집 = True
-        # combined_mesh.remove_triangles_by_mask(~mask)
-        # combined_mesh.remove_unreferenced_vertices()
-        
-        # 상대 면적 기준
-        tri_clusters, _, cluster_area = combined_mesh.cluster_connected_triangles()
-        cluster_area = np.asarray(cluster_area)
-
-        largest = float(cluster_area.max()) if len(cluster_area) else 0.0
-        alpha = 0.005   # 예: 최대 군집의 0.5% 미만은 제거
-        abs_floor = 800 * 0.5 * (voxel_size ** 2)  # 안전 바닥(아래 설명)
-        thresh = max(alpha * largest, abs_floor)
-
-        keep_ids = np.where(cluster_area >= thresh)[0]
-        mask = np.isin(tri_clusters, keep_ids)
-        combined_mesh.remove_triangles_by_mask(~mask)
-        combined_mesh.remove_unreferenced_vertices()
-
-        print(f"  In multiframe example, Mesh remove triangles time: {time.time() - triangle_postprocess_start:.4f} seconds") # 0.04s
-
-
-        
-        T_B_C = T_B_M @ T_mc
-        
-        T_mw = T_mc_list[0].copy()
-        T_W_B = np.linalg.inv(T_B_M @ T_mw)
-        T_W_C = np.linalg.inv(T_mw) @ T_mc
         
 
         
@@ -1554,82 +1754,106 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, dept
         # 3. 각 로봇 링크 메시를 결합
         for link_name, robot_mesh in robot_meshes.items():
             if robot_mesh is not None and len(robot_mesh.vertices) > 0:
-                combined_mesh += robot_mesh
+                scene_mesh += robot_mesh
                 vprint(f"    Added robot link {link_name}: {len(robot_mesh.vertices)} vertices")
         
-        if len(combined_mesh.vertices) == 0:
-            print("  WARNING: Combined mesh has no vertices!")
-        if len(combined_mesh.triangles) == 0:
-            print("  WARNING: Combined mesh has no triangles!")
-        
-        visibility_results = np.zeros((tracking_3d.shape[0]), dtype=bool)  # True if visible, False if occluded
-        hit_distances = np.zeros((tracking_3d.shape[0]), dtype=np.float64)  # Hit distances for each viewpoint and query point
+        if len(scene_mesh.vertices) == 0:
+            print("  WARNING: Scene mesh has no vertices!")
+        if len(scene_mesh.triangles) == 0:
+            print("  WARNING: Scene mesh has no triangles!")
 
         
         
-        mesh_tensor = o3d.t.geometry.TriangleMesh.from_legacy(combined_mesh)
-        
-        # 5. Ray casting scene 생성
-        current_scene = o3d.t.geometry.RaycastingScene()
-        current_scene.add_triangles(mesh_tensor)
-        
-        
-        viewpoints_for_this_robot = relative_pose[:3, 3] 
-        viewdirections_for_this_robot = R.from_matrix(relative_pose[:3, :3]).as_euler('xyz', degrees=True)
-        vprint(f"  Viewpoints for this robot: {viewpoints_for_this_robot.shape} (M viewpoints)")
-        
-        
-        
-        # NOTE: this is assumed to be in slam's world coordinate (first frame is the world)
-        viewpoint = viewpoints_for_this_robot
-        viewdirection = viewdirections_for_this_robot  # [roll, pitch, yaw] in degrees
-        
-        print(f" view:{viewpoint} {viewdirection}")
-        
+        # 쿼리 포인트를 월드 좌표계로 변환
+        T_W_C = np.linalg.inv(T_mw) @ T_mc
         query_point_in_world_coordinate = []
-        # N개의 쿼리 포인트에 대해 visibility 체크
         for query_idx in range(tracking_3d.shape[0]): 
-            
             # assume it is in camera coordinate
             query_point_homo = np.concatenate([tracking_3d[query_idx], [1]])[:, None] # [4, 1]
             # convert to world coordinate
             query_point = (T_W_C @ query_point_homo)[:3, 0] # [3]
             query_point_in_world_coordinate.append(query_point.copy())
-            
-            # 1. LOS 체크 (기존 raycasting)
-            direction = query_point - viewpoint # NOTE: this is valid only when both variables are in the same coordinate
-            distance = np.linalg.norm(direction)
-            direction_normalized = direction / distance
-            
-            # 단일 ray에 대한 raycasting
-            origins_single = viewpoint.reshape(1, 3)
-            directions_single = direction_normalized.reshape(1, 3)
-            distances_single = np.array([distance - OFFSET_DISTANCE])
-            
-            los_visible, los_hit_distances = batch_raycasting_with_scene(
-                current_scene, origins_single, directions_single, distances_single
-            )
-            los_visible = los_visible[0]
-            los_hit_distance = los_hit_distances[0]
-            
-            # 2. 카메라 frustum 체크
-            frustum_visible = is_point_in_camera_frustum(
-                query_point, viewpoint, viewdirection, K_frame, image_size
-            )
-            
-            # 3. 최종 visibility: LOS 체크와 frustum 체크를 모두 통과해야 함
-            final_visible = los_visible and frustum_visible
-            
-            # 결과 저장
-            visibility_results[query_idx] = final_visible
-            hit_distances[query_idx] = los_hit_distance
-            
-            # 상세 로그 출력
-            los_status = "LOS_OK" if los_visible else "LOS_BLOCKED"
-            frustum_status = "FRUSTUM_OK" if frustum_visible else "FRUSTUM_OUT"
-            final_status = "VISIBLE" if final_visible else "OCCLUDED"
-            
-            print(f"      Query {query_idx + 1}: {final_status} (LOS: {los_status}, Frustum: {frustum_status}, dist(without offset): {distance:.3f}m, hit: {los_hit_distance:.3f}m) query_point: {query_point}")
+        
+        mesh_tensor = o3d.t.geometry.TriangleMesh.from_legacy(scene_mesh)
+        
+        # 5. Ray casting scene 생성
+        current_scene = o3d.t.geometry.RaycastingScene()
+        current_scene.add_triangles(mesh_tensor)
+        
+        # 카메라 pose list 생성 (기존 카메라와 active camera 모두)
+        current_camera_pose_np = pose_tensor.cpu().numpy() if isinstance(pose_tensor, torch.Tensor) else pose_tensor
+        
+        # 기존 카메라 pose list 생성 (현재 카메라 pose 복사)
+        current_camera_pose_list = create_current_camera_pose_list(current_camera_pose_np, num_cameras=10)
+        print(f"Generated {len(current_camera_pose_list)} current camera poses")
+        
+        # 선택된 인덱스 정의 (카메라 리스트 길이에 관계없이 고정)
+        selected_indices = [0, 5, 9]  # 고정된 인덱스 사용
+        selected_indices = sorted(list(set(selected_indices)))
+        
+        # 기존 카메라에 대한 visibility 계산 (선택된 인덱스만)
+        print(f"Computing visibility for current cameras at indices: {selected_indices}")
+        
+        # 각 선택된 기존 카메라에 대한 visibility 계산
+        current_visibility_results_dict = {}
+        
+        for cam_idx in selected_indices:
+            if cam_idx < len(current_camera_pose_list):
+                current_camera_pose = current_camera_pose_list[cam_idx]
+                current_viewpoint = current_camera_pose[:3, 3]
+                current_viewdirection = R.from_matrix(current_camera_pose[:3, :3]).as_euler('xyz', degrees=True)
+                
+                print(f"Computing visibility for current camera {cam_idx} at: {current_viewpoint}")
+                
+                # 현재 카메라에 대한 visibility 계산
+                current_visibility_results = np.zeros((tracking_3d.shape[0]), dtype=bool)
+                current_hit_distances = np.zeros((tracking_3d.shape[0]), dtype=np.float64)
+                
+                for query_idx in range(tracking_3d.shape[0]):
+                    query_point = query_point_in_world_coordinate[query_idx]
+                    
+                    # 1. LOS 체크 (기존 카메라에서)
+                    direction = query_point - current_viewpoint
+                    distance = np.linalg.norm(direction)
+                    direction_normalized = direction / distance
+                    
+                    # 단일 ray에 대한 raycasting
+                    origins_single = current_viewpoint.reshape(1, 3)
+                    directions_single = direction_normalized.reshape(1, 3)
+                    distances_single = np.array([distance - OFFSET_DISTANCE])
+                    
+                    los_visible, los_hit_distances = batch_raycasting_with_scene(
+                        current_scene, origins_single, directions_single, distances_single
+                    )
+                    los_visible = los_visible[0]
+                    los_hit_distance = los_hit_distances[0]
+                    
+                    # 2. 카메라 frustum 체크 (기존 카메라에서)
+                    frustum_visible = is_point_in_camera_frustum(
+                        query_point, current_viewpoint, current_viewdirection, K_frame, image_size
+                    )
+                    
+                    # 3. 최종 visibility: LOS 체크와 frustum 체크를 모두 통과해야 함
+                    final_visible = los_visible and frustum_visible
+                    
+                    # 결과 저장
+                    current_visibility_results[query_idx] = final_visible
+                    current_hit_distances[query_idx] = los_hit_distance
+                    
+                    # 상세 로그 출력
+                    los_status = "LOS_OK" if los_visible else "LOS_BLOCKED"
+                    frustum_status = "FRUSTUM_OK" if frustum_visible else "FRUSTUM_OUT"
+                    final_status = "VISIBLE" if final_visible else "OCCLUDED"
+                    
+                    print(f"      Current Camera {cam_idx} Query {query_idx + 1}: {final_status} (LOS: {los_status}, Frustum: {frustum_status}, dist(without offset): {distance:.3f}m, hit: {los_hit_distance:.3f}m) query_point: {query_point}")
+                
+                # 결과를 딕셔너리에 저장
+                current_visibility_results_dict[cam_idx] = current_visibility_results
+                print(f"Current camera {cam_idx} visibility results: {np.sum(current_visibility_results)}/{len(current_visibility_results)} points visible")
+        
+        # 첫 번째 선택된 카메라의 결과를 기본 visibility_results로 설정 (기존 코드 호환성)
+        if selected_indices:
+            visibility_results = current_visibility_results_dict[selected_indices[0]]
             
 
 
@@ -1660,23 +1884,93 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, dept
         else:
             point_cloud = point_cloud_camera
         
-        # visualize 함수에 LOS 관련 매개변수 전달 (옵션)
+        # active_camera 모드인 경우 active_camera_pose_list 생성
+        active_camera_pose_list = None
+        if active_camera:
+            # 현재 카메라 pose를 기준으로 active_camera_pose_list 생성
+            active_camera_pose_list = create_active_camera_pose_list(current_camera_pose_np, num_cameras=10, translation_step=-0.05)
+            print(f"Generated {len(active_camera_pose_list)} active camera poses")
+            
+            # 지정된 인덱스의 active camera들에 대한 visibility 계산 (기존 카메라와 동일한 인덱스 사용)
+            if len(active_camera_pose_list) > 0:
+                print(f"Computing visibility for active cameras at indices: {selected_indices}")
+                
+                # 각 선택된 active camera에 대한 visibility 계산
+                active_visibility_results_dict = {}
+                
+                for cam_idx in selected_indices:
+                    if cam_idx < len(active_camera_pose_list):
+                        active_camera_pose = active_camera_pose_list[cam_idx]
+                        active_viewpoint = active_camera_pose[:3, 3]
+                        active_viewdirection = R.from_matrix(active_camera_pose[:3, :3]).as_euler('xyz', degrees=True)
+                        
+                        print(f"Computing visibility for active camera {cam_idx} at: {active_viewpoint}")
+                        
+                        # 현재 active camera에 대한 visibility 계산
+                        current_visibility_results = np.zeros((tracking_3d.shape[0]), dtype=bool)
+                        current_hit_distances = np.zeros((tracking_3d.shape[0]), dtype=np.float64)
+                        
+                        for query_idx in range(tracking_3d.shape[0]):
+                            query_point = query_point_in_world_coordinate[query_idx]
+                            
+                            # 1. LOS 체크 (active camera에서)
+                            direction = query_point - active_viewpoint
+                            distance = np.linalg.norm(direction)
+                            direction_normalized = direction / distance
+                            
+                            # 단일 ray에 대한 raycasting
+                            origins_single = active_viewpoint.reshape(1, 3)
+                            directions_single = direction_normalized.reshape(1, 3)
+                            distances_single = np.array([distance - OFFSET_DISTANCE])
+                            
+                            los_visible, los_hit_distances = batch_raycasting_with_scene(
+                                current_scene, origins_single, directions_single, distances_single
+                            )
+                            los_visible = los_visible[0]
+                            los_hit_distance = los_hit_distances[0]
+                            
+                            # 2. 카메라 frustum 체크 (active camera에서)
+                            frustum_visible = is_point_in_camera_frustum(
+                                query_point, active_viewpoint, active_viewdirection, K_frame, image_size
+                            )
+                            
+                            # 3. 최종 visibility: LOS 체크와 frustum 체크를 모두 통과해야 함
+                            final_visible = los_visible and frustum_visible
+                            
+                            # 결과 저장
+                            current_visibility_results[query_idx] = final_visible
+                            current_hit_distances[query_idx] = los_hit_distance
+                            
+                            # 상세 로그 출력
+                            los_status = "LOS_OK" if los_visible else "LOS_BLOCKED"
+                            frustum_status = "FRUSTUM_OK" if frustum_visible else "FRUSTUM_OUT"
+                            final_status = "VISIBLE" if final_visible else "OCCLUDED"
+                            
+                            print(f"      Active Camera {cam_idx} Query {query_idx + 1}: {final_status} (LOS: {los_status}, Frustum: {frustum_status}, dist(without offset): {distance:.3f}m, hit: {los_hit_distance:.3f}m) query_point: {query_point}")
+                        
+                        # 결과를 딕셔너리에 저장
+                        active_visibility_results_dict[cam_idx] = current_visibility_results
+                        print(f"Active camera {cam_idx} visibility results: {np.sum(current_visibility_results)}/{len(current_visibility_results)} points visible")
+                
+                
+        
+        
         visualizer.visualize(
-            color_mesh=combined_mesh, 
+            color_mesh=scene_mesh, 
             point_cloud=point_cloud,
             camera_pose=pose_tensor,
-            query_points=np.stack(query_point_in_world_coordinate), # [N, 3]  # None이면 LOS 시각화 안함
-            visibility_results=visibility_results,  # None이면 LOS 시각화 안함
+            query_points=np.stack(query_point_in_world_coordinate), # [N, 3]
+            visibility_results=visibility_results,  # 기존 카메라의 visibility 결과
             camera_intrinsics=K_frame,  # 카메라 내부 파라미터
-            image_size=image_size  # 이미지 크기
+            image_size=image_size,  # 이미지 크기
+            current_camera_pose_list=current_camera_pose_list,  # 기존 카메라 pose 리스트
+            current_visibility_results_dict=current_visibility_results_dict,  # 기존 카메라의 visibility 결과
+            active_camera_pose_list=active_camera_pose_list,  # active camera pose 리스트
+            active_visibility_results_dict=active_visibility_results_dict if 'active_visibility_results_dict' in locals() else None,  # 모든 선택된 active camera의 visibility 결과
+            selected_indices=selected_indices  # 선택된 인덱스들
         )
         
-        # Interactive HTML export를 위한 데이터 저장
-        if export_interactive_html:
-            interactive_meshes.append(combined_mesh)
-            camera_poses_for_export.append(pose_tensor.cpu().numpy())
         
-        print(f"  Frame {frame_idx + 1} integrated - mesh has {color_mesh.vertices().shape[0]} vertices and {color_mesh.triangles().shape[0]} triangles")
         print(f"  Process frame time: {time.time() - start:.4f} seconds")
         
         
@@ -1685,37 +1979,6 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, dept
     mapper.update_color_mesh()
     mapper.get_color_mesh().save(save_path+'/3d_visualization_animate_multiframe_nvblox.ply')
     
-    # Interactive HTML export
-    if export_interactive_html and interactive_meshes:
-        
-        from interactive_3d_exporter import create_custom_threejs_viewer
-        
-        # HTML 파일 경로 생성
-        base_path = save_path.replace('.ply', '')
-        threejs_html_path = f"{base_path}_interactive_threejs.html"
-        
-        # 최종 mesh export (Custom Three.js 방식만 사용)
-        final_mesh = interactive_meshes[-1]  # 마지막 프레임의 mesh
-        
-        # mesh가 비어있는 경우 fallback mesh 생성
-        if len(final_mesh.vertices) == 0 or len(final_mesh.triangles) == 0:
-            print("Warning: Final mesh is empty, creating fallback mesh...")
-            
-            fallback_mesh = o3d.geometry.TriangleMesh.create_box(width=1, height=1, depth=1)
-            fallback_mesh.paint_uniform_color([0.7, 0.1, 0.1])
-            final_mesh = fallback_mesh
-        
-        create_custom_threejs_viewer(
-            final_mesh,
-            threejs_html_path,
-            title="NVBlox Interactive 3D Visualization"
-        )
-        
-        # 카메라 궤적이 있는 경우 추가 정보 표시
-        if len(camera_poses_for_export) > 1:
-            print(f"Camera trajectory data available: {len(camera_poses_for_export)} poses")
-        
-        print(f"Interactive HTML visualization saved: {threejs_html_path}")
     
     # 비디오 저장
     if visualizer.video_save and (len(visualizer.captured_frames_mesh) > 0 or len(visualizer.captured_frames_point_cloud) > 0):
@@ -1865,7 +2128,6 @@ def main():
     T_mc_list = []
     action_list = []
     tracking_3d_list = []
-    fake_depth_masks_resized_list = []
     
     for frame_offset in range(num_multiframe_frames):
         current_frame_idx = FRAME_IDX + frame_offset
@@ -1874,7 +2136,7 @@ def main():
         rgb, depth_raw, fake_depth_mask, relative_pose, T_mc, act, track_3d = get_data(rgb_frames, depth_frames, relative_poses, combined_mask, T_mc_transformation, action, tracking_3d, current_frame_idx, DEPTH_SCALE)
         # 1.5) 이미지 리사이즈 (옵션) - UniDepth 사용시에는 RGB만 리사이즈
         if RESIZE:
-            rgb_resized, _, scale_factor_x, scale_factor_y, fake_depth_mask_resized = resize_image_and_depth(rgb, depth_raw, RESIZE_SIZE, fake_depth_mask)
+            rgb_resized, _, scale_factor_x, scale_factor_y, _ = resize_image_and_depth(rgb, depth_raw, RESIZE_SIZE)
         else:
             rgb_resized = rgb
         
@@ -1890,7 +2152,6 @@ def main():
         T_mc_list.append(T_mc)
         action_list.append(act)
         tracking_3d_list.append(track_3d)
-        fake_depth_masks_resized_list.append(fake_depth_mask_resized)
         vprint(f"  Loaded frame {frame_offset + 1}/{num_multiframe_frames} (index: {current_frame_idx})")
             
     vprint(f"Successfully loaded {len(rgb_frames_list)} frames for multiframe visualization")
@@ -1902,12 +2163,11 @@ def main():
         create_multiframe_nvblox(
             "visibility_test_output",
             rgb_frames_list, depth_frames_list, depth_frames_wo_fake_depth_list, relative_poses_list, K_adjusted_list, T_mc_list, action_list, tracking_3d_list,
-            fake_depth_masks_resized_list=fake_depth_masks_resized_list,
             robot_viz=robot_viz,
             voxel_size=VOXEL_SIZE,
-            export_interactive_html=False,  # Interactive HTML export 활성화
             image_size=image_size,
             follow_camera_view=True,
+            active_camera=True,  # active_camera 모드 활성화
         )
         vprint("NVBlox multi-frame scene mesh animated visualization saved to: visibility_test_output/3d_visualization_animate_multiframe_nvblox.html")
     else:
