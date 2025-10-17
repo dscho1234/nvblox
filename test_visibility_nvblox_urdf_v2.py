@@ -18,6 +18,7 @@ from plotly.subplots import make_subplots
 import copy
 import gc
 from urdf_parser_py.urdf import URDF
+import numpy as np
 import xml.etree.ElementTree as ET
 from scipy.spatial.transform import Rotation as R
 import trimesh
@@ -45,6 +46,226 @@ def vprint(*args, **kwargs) -> None:
     """Print only when VERBOSE is True."""
     if VERBOSE:
         print(*args, **kwargs)
+
+
+#!/usr/bin/env python3
+"""
+Unconstrained Inverse Kinematics Solver
+
+This script provides methods to solve inverse kinematics without workspace constraints,
+focusing only on achieving the target pose regardless of singularities or workspace limits.
+"""
+
+import sys
+import os
+import numpy as np
+from scipy.optimize import minimize
+import time
+
+# Add the lib directory to the path
+sys.path.append(os.path.join(os.path.dirname(__file__), "lib"))
+import unitree_arm_interface
+
+
+    
+
+# ========= Reward Tracking Class =========
+class RewardTracker:
+    """
+    매 프레임마다 visibility reward를 추적하고 저장하는 클래스
+    기존 카메라와 active camera의 reward를 모두 추적
+    """
+    def __init__(self):
+        # 기존 카메라 reward 데이터
+        self.current_frame_rewards = []  # 각 프레임의 기존 카메라 reward 저장
+        self.current_frame_indices = []  # 프레임 인덱스 저장
+        self.current_total_visible_points = []  # 각 프레임에서 보이는 포인트 수
+        self.current_total_query_points = []  # 각 프레임의 총 쿼리 포인트 수
+        
+        # Active 카메라 reward 데이터
+        self.active_frame_rewards = []  # 각 프레임의 active 카메라 reward 저장
+        self.active_frame_indices = []  # 프레임 인덱스 저장
+        self.active_total_visible_points = []  # 각 프레임에서 보이는 포인트 수
+        self.active_total_query_points = []  # 각 프레임의 총 쿼리 포인트 수
+        
+    def add_current_camera_reward(self, frame_idx, visibility_results):
+        """
+        기존 카메라의 visibility 결과를 reward로 저장
+        
+        Args:
+            frame_idx (int): 프레임 인덱스
+            visibility_results (np.array): visibility 결과 배열 (boolean)
+        """
+        if visibility_results is not None:
+            visible_count = np.sum(visibility_results)
+            total_count = len(visibility_results)
+            reward = visible_count / total_count if total_count > 0 else 0.0
+            
+            self.current_frame_rewards.append(reward)
+            self.current_frame_indices.append(frame_idx)
+            self.current_total_visible_points.append(visible_count)
+            self.current_total_query_points.append(total_count)
+            
+            print(f"Frame {frame_idx} [Current Camera]: Reward = {reward:.4f} ({visible_count}/{total_count} points visible)")
+        else:
+            # visibility_results가 None인 경우 0 reward
+            self.current_frame_rewards.append(0.0)
+            self.current_frame_indices.append(frame_idx)
+            self.current_total_visible_points.append(0)
+            self.current_total_query_points.append(0)
+            print(f"Frame {frame_idx} [Current Camera]: Reward = 0.0000 (no visibility data)")
+    
+    def add_active_camera_reward(self, frame_idx, visibility_results):
+        """
+        Active 카메라의 visibility 결과를 reward로 저장
+        
+        Args:
+            frame_idx (int): 프레임 인덱스
+            visibility_results (np.array): visibility 결과 배열 (boolean)
+        """
+        if visibility_results is not None:
+            visible_count = np.sum(visibility_results)
+            total_count = len(visibility_results)
+            reward = visible_count / total_count if total_count > 0 else 0.0
+            
+            self.active_frame_rewards.append(reward)
+            self.active_frame_indices.append(frame_idx)
+            self.active_total_visible_points.append(visible_count)
+            self.active_total_query_points.append(total_count)
+            
+            print(f"Frame {frame_idx} [Active Camera]: Reward = {reward:.4f} ({visible_count}/{total_count} points visible)")
+        else:
+            # visibility_results가 None인 경우 0 reward
+            self.active_frame_rewards.append(0.0)
+            self.active_frame_indices.append(frame_idx)
+            self.active_total_visible_points.append(0)
+            self.active_total_query_points.append(0)
+            print(f"Frame {frame_idx} [Active Camera]: Reward = 0.0000 (no visibility data)")
+    
+    def add_frame_reward(self, frame_idx, visibility_results):
+        """
+        기존 호환성을 위한 메서드 (기존 카메라로 처리)
+        """
+        self.add_current_camera_reward(frame_idx, visibility_results)
+    
+    def plot_reward_changes(self, save_path="visibility_test_output"):
+        """
+        프레임에 따른 reward 변화를 plot하고 저장 (기존 카메라와 active 카메라 비교)
+        
+        Args:
+            save_path (str): 저장할 경로
+        """
+        has_current_data = len(self.current_frame_rewards) > 0
+        has_active_data = len(self.active_frame_rewards) > 0
+        
+        if not has_current_data and not has_active_data:
+            print("No reward data to plot")
+            return
+            
+        # matplotlib을 사용한 plot 생성
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
+        
+        # 1. Reward 변화 그래프 (비교)
+        if has_current_data:
+            ax1.plot(self.current_frame_indices, self.current_frame_rewards, 'b-', 
+                    linewidth=2, marker='o', markersize=4, label='Current Camera', alpha=0.8)
+        if has_active_data:
+            ax1.plot(self.active_frame_indices, self.active_frame_rewards, 'r-', 
+                    linewidth=2, marker='s', markersize=4, label='Active Camera', alpha=0.8)
+        
+        ax1.set_xlabel('Frame Index')
+        ax1.set_ylabel('Reward (Visibility Ratio)')
+        ax1.set_title('Visibility Reward Comparison: Current vs Active Camera')
+        ax1.grid(True, alpha=0.3)
+        ax1.set_ylim(0, 1)
+        ax1.legend()
+        
+        # 2. 보이는 포인트 수 변화 (비교)
+        if has_current_data:
+            ax2.plot(self.current_frame_indices, self.current_total_visible_points, 'b-', 
+                    linewidth=2, marker='o', markersize=4, label='Current Camera', alpha=0.8)
+        if has_active_data:
+            ax2.plot(self.active_frame_indices, self.active_total_visible_points, 'r-', 
+                    linewidth=2, marker='s', markersize=4, label='Active Camera', alpha=0.8)
+        
+        ax2.set_xlabel('Frame Index')
+        ax2.set_ylabel('Number of Visible Points')
+        ax2.set_title('Visible Points Count Comparison')
+        ax2.grid(True, alpha=0.3)
+        ax2.legend()
+        
+        # 3. Reward 분포 히스토그램 (비교)
+        if has_current_data and has_active_data:
+            ax3.hist(self.current_frame_rewards, bins=20, alpha=0.6, color='blue', 
+                    edgecolor='black', label='Current Camera', density=True)
+            ax3.hist(self.active_frame_rewards, bins=20, alpha=0.6, color='red', 
+                    edgecolor='black', label='Active Camera', density=True)
+            ax3.legend()
+        elif has_current_data:
+            ax3.hist(self.current_frame_rewards, bins=20, alpha=0.7, color='blue', 
+                    edgecolor='black', label='Current Camera')
+        elif has_active_data:
+            ax3.hist(self.active_frame_rewards, bins=20, alpha=0.7, color='red', 
+                    edgecolor='black', label='Active Camera')
+        
+        ax3.set_xlabel('Reward Value')
+        ax3.set_ylabel('Density' if has_current_data and has_active_data else 'Frequency')
+        ax3.set_title('Reward Distribution Comparison')
+        ax3.grid(True, alpha=0.3)
+        
+        # 4. 누적 평균 reward (비교)
+        if has_current_data:
+            current_cumulative_avg = np.cumsum(self.current_frame_rewards) / np.arange(1, len(self.current_frame_rewards) + 1)
+            ax4.plot(self.current_frame_indices, current_cumulative_avg, 'b-', 
+                    linewidth=2, marker='o', markersize=4, label='Current Camera', alpha=0.8)
+        if has_active_data:
+            active_cumulative_avg = np.cumsum(self.active_frame_rewards) / np.arange(1, len(self.active_frame_rewards) + 1)
+            ax4.plot(self.active_frame_indices, active_cumulative_avg, 'r-', 
+                    linewidth=2, marker='s', markersize=4, label='Active Camera', alpha=0.8)
+        
+        ax4.set_xlabel('Frame Index')
+        ax4.set_ylabel('Cumulative Average Reward')
+        ax4.set_title('Cumulative Average Reward Comparison')
+        ax4.grid(True, alpha=0.3)
+        ax4.legend()
+        
+        plt.tight_layout()
+        
+        # 저장
+        os.makedirs(save_path, exist_ok=True)
+        plot_path = os.path.join(save_path, "reward_analysis.png")
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # 통계 정보 출력
+        print(f"\n=== Reward Analysis Summary ===")
+        if has_current_data:
+            print(f"Current Camera - Total frames: {len(self.current_frame_rewards)}")
+            print(f"Current Camera - Average reward: {np.mean(self.current_frame_rewards):.4f}")
+            print(f"Current Camera - Max reward: {np.max(self.current_frame_rewards):.4f}")
+            print(f"Current Camera - Min reward: {np.min(self.current_frame_rewards):.4f}")
+            print(f"Current Camera - Std deviation: {np.std(self.current_frame_rewards):.4f}")
+            print(f"Current Camera - Final reward: {self.current_frame_rewards[-1]:.4f}")
+        
+        if has_active_data:
+            print(f"Active Camera - Total frames: {len(self.active_frame_rewards)}")
+            print(f"Active Camera - Average reward: {np.mean(self.active_frame_rewards):.4f}")
+            print(f"Active Camera - Max reward: {np.max(self.active_frame_rewards):.4f}")
+            print(f"Active Camera - Min reward: {np.min(self.active_frame_rewards):.4f}")
+            print(f"Active Camera - Std deviation: {np.std(self.active_frame_rewards):.4f}")
+            print(f"Active Camera - Final reward: {self.active_frame_rewards[-1]:.4f}")
+        
+        if has_current_data and has_active_data:
+            current_avg = np.mean(self.current_frame_rewards)
+            active_avg = np.mean(self.active_frame_rewards)
+            improvement = ((active_avg - current_avg) / current_avg * 100) if current_avg > 0 else 0
+            print(f"\nComparison:")
+            print(f"Active camera improvement: {improvement:+.2f}%")
+            print(f"Reward difference: {active_avg - current_avg:+.4f}")
+        
+        print(f"Reward analysis plot saved to: {plot_path}")
+        
+        return plot_path
 
 # ========= Z1 Robot Visualizer Class =========
 class Z1RobotVisualizer:
@@ -87,6 +308,16 @@ class Z1RobotVisualizer:
             'z1_GripperMover': [0.8, 0.8, 0.8],  
             'z1_GripperStator': [0.8, 0.8, 0.8],
         }
+
+        self.joint_limits = [
+            (-2.618, 2.618),   # J1: ±150°
+            (0, 3.142),        # J2: 0—180°
+            (-2.879, 0),       # J3: -165°—0
+            (-1.396, 1.396),   # J4: ±80°
+            (-1.484, 1.484),   # J5: ±85°
+            (-2.793, 2.793)    # J6: ±160°
+        ]
+        
 
         # Unitree Z1 SDK 초기화
         try:
@@ -141,6 +372,33 @@ class Z1RobotVisualizer:
                                 # STL 파일 로드
                                 mesh_obj = o3d.io.read_triangle_mesh(stl_path)
                                 if len(mesh_obj.vertices) > 0:
+                                    # 메시 단순화 (raycasting 성능 향상)
+                                    original_vertices = len(mesh_obj.vertices)
+                                    original_triangles = len(mesh_obj.triangles)
+                                    
+                                    # 삼각형 개수를 50%로 줄이기 (target_triangle_count 설정)
+                                    if link_name in ['link00', 'link01', 'link02', 'link03', 'link04']:
+                                        target_triangle_count = 100  # 최소 100개 삼각형 유지
+                                    else:
+                                        target_triangle_count = max(100, original_triangles // 4)  # 최소 100개 삼각형 유지
+                                    
+                                    # 메시 단순화
+                                    mesh_obj = mesh_obj.simplify_quadric_decimation(target_triangle_count)
+                                    
+                                    # vertices도 최적화 (중복 제거 및 정리)
+                                    mesh_obj.remove_degenerate_triangles()
+                                    mesh_obj.remove_duplicated_triangles()
+                                    mesh_obj.remove_duplicated_vertices()
+                                    mesh_obj.remove_unreferenced_vertices()
+                                    
+                                    # 메시가 너무 단순화되었는지 확인
+                                    if len(mesh_obj.vertices) < 10:
+                                        # 너무 단순화된 경우 원본 메시 사용
+                                        mesh_obj = o3d.io.read_triangle_mesh(stl_path)
+                                        print(f"메시가 너무 단순화됨, 원본 사용: {link_name}")
+                                    else:
+                                        print(f"메시 단순화 완료: {link_name} - {original_vertices}→{len(mesh_obj.vertices)} vertices, {original_triangles}→{len(mesh_obj.triangles)} triangles")
+                                    
                                     mesh_obj.vertex_colors = o3d.utility.Vector3dVector(np.tile(np.array(self.link_colors[link_name])[None, :], (len(mesh_obj.vertices), 1)))
                                     self.meshes[link_name] = mesh_obj
                                     vprint(f"STL 메시 로드 성공: {link_name} -> {stl_path} ({len(mesh_obj.vertices)} vertices)")
@@ -182,6 +440,30 @@ class Z1RobotVisualizer:
                 if os.path.exists(stl_path):
                     mesh_obj = o3d.io.read_triangle_mesh(stl_path)
                     if len(mesh_obj.vertices) > 0:
+                        # 메시 단순화 (raycasting 성능 향상)
+                        original_vertices = len(mesh_obj.vertices)
+                        original_triangles = len(mesh_obj.triangles)
+                        
+                        # 삼각형 개수를 50%로 줄이기 (target_triangle_count 설정)
+                        target_triangle_count = max(100, original_triangles // 4)  # 최소 100개 삼각형 유지
+                        
+                        # 메시 단순화
+                        mesh_obj = mesh_obj.simplify_quadric_decimation(target_triangle_count)
+                        
+                        # vertices도 최적화 (중복 제거 및 정리)
+                        mesh_obj.remove_degenerate_triangles()
+                        mesh_obj.remove_duplicated_triangles()
+                        mesh_obj.remove_duplicated_vertices()
+                        mesh_obj.remove_unreferenced_vertices()
+                        
+                        # 메시가 너무 단순화되었는지 확인
+                        if len(mesh_obj.vertices) < 10:
+                            # 너무 단순화된 경우 원본 메시 사용
+                            mesh_obj = o3d.io.read_triangle_mesh(stl_path)
+                            print(f"Gripper 메시가 너무 단순화됨, 원본 사용: {gripper_name}")
+                        else:
+                            print(f"Gripper 메시 단순화 완료: {gripper_name} - {original_vertices}→{len(mesh_obj.vertices)} vertices, {original_triangles}→{len(mesh_obj.triangles)} triangles")
+                        
                         mesh_obj.vertex_colors = o3d.utility.Vector3dVector(np.tile(np.array(self.link_colors[gripper_name])[None, :], (len(mesh_obj.vertices), 1)))            
                         self.meshes[gripper_name] = mesh_obj
                         vprint(f"Gripper STL 메시 로드 성공: {gripper_name} -> {stl_path} ({len(mesh_obj.vertices)} vertices)")
@@ -209,8 +491,130 @@ class Z1RobotVisualizer:
         """조인트 각도 설정"""
         self.joint_angles = np.array(angles)
         vprint(f"조인트 각도 설정: {self.joint_angles}")
+    
+    
+    
+    def solve_ik_optimization(self, target_T, initial_guess=None):
+        """
+        Solve IK using optimization-based method with joint limits.
         
-    def solve_inverse_kinematics(self, target_pose, gripper_angle=0.0):
+        Args:
+            target_T: Target 4x4 transformation matrix
+            initial_guess: Initial joint angle guess
+            
+        Returns:
+            tuple: (success, joint_angles, final_error)
+        """
+        if initial_guess is None:
+            initial_guess = np.zeros(6)
+        
+        # Use class joint limits
+        
+        def objective(q):
+            """Objective function: pose error."""
+            try:
+                current_T = self.arm_interface._ctrlComp.armModel.forwardKinematics(q, 6)
+                error = self._compute_pose_error(target_T, current_T)
+                return np.sum(error**2)
+            except:
+                return 1e6  # Large error if FK fails
+        
+        # Use scipy optimization with bounds
+        result = minimize(
+            objective, 
+            initial_guess, 
+            method='L-BFGS-B',
+            bounds=self.joint_limits,
+            options={'maxiter': 1000, 'gtol': 1e-8}
+        )
+        
+        if result.success:
+            final_error = np.sqrt(result.fun)
+            return True, result.x, final_error
+        else:
+            return False, result.x, np.sqrt(result.fun)
+    
+    def solve_ik_multiple_guesses(self, target_T, initial_guess=None, num_guesses=10, noise_std=0.1):
+        """
+        Solve IK using multiple random initial guesses within joint limits.
+        
+        Args:
+            target_T: Target 4x4 transformation matrix
+            num_guesses: Number of random initial guesses to try
+            
+        Returns:
+            tuple: (success, best_joint_angles, best_error)
+        """
+        # Use class joint limits
+        
+        best_error = float('inf')
+        best_q = None
+        best_success = False
+        
+        for i in range(num_guesses):
+            # Generate random initial guess within joint limits
+            if initial_guess is not None and i == 0:
+                # First guess: use the provided initial_guess
+                guess = initial_guess.copy()
+            elif initial_guess is not None:
+                # Subsequent guesses: add noise around initial_guess
+                noise = np.random.normal(0, noise_std, 6)
+                guess = initial_guess + noise
+                
+                # Ensure the guess is within joint limits
+                guess = np.clip(guess, 
+                              [limit[0] for limit in self.joint_limits], 
+                              [limit[1] for limit in self.joint_limits])
+            else:
+                # No initial_guess provided: generate random guess within joint limits
+                guess = np.array([
+                    np.random.uniform(self.joint_limits[j][0], self.joint_limits[j][1]) 
+                    for j in range(6)
+                ])
+            
+            # Try optimization method
+            success, q, error = self.solve_ik_optimization(target_T, guess)
+            
+            if success and error < best_error:
+                best_error = error
+                best_q = q
+                best_success = True
+        
+        return best_success, best_q, best_error
+    
+    def _compute_pose_error(self, target_T, current_T):
+        """
+        Compute pose error between target and current transformation matrices.
+        
+        Args:
+            target_T: Target 4x4 transformation matrix
+            current_T: Current 4x4 transformation matrix
+            
+        Returns:
+            np.array: 6D error vector [position_error(3), orientation_error(3)]
+        """
+        # Position error
+        pos_error = target_T[:3, 3] - current_T[:3, 3]
+        
+        # Orientation error using axis-angle representation
+        R_rel = target_T[:3, :3].T @ current_T[:3, :3]
+        angle = np.arccos(np.clip((np.trace(R_rel) - 1) / 2, -1, 1))
+        
+        if angle > 1e-6:
+            axis = np.array([R_rel[2,1] - R_rel[1,2], 
+                            R_rel[0,2] - R_rel[2,0], 
+                            R_rel[1,0] - R_rel[0,1]]) / (2 * np.sin(angle))
+            rot_error = angle * axis
+        else:
+            rot_error = np.zeros(3)
+        
+        # Combine position and rotation errors
+        error = np.concatenate([pos_error, rot_error])
+        
+        return error
+    
+
+    def solve_inverse_kinematics(self, target_pose):
         """Inverse Kinematics를 사용하여 목표 pose에서 조인트 각도 계산"""
         if self.arm_interface is None:
             vprint("Unitree Z1 SDK가 초기화되지 않았습니다.")
@@ -220,17 +624,27 @@ class Z1RobotVisualizer:
             # 현재 조인트 각도를 초기 추정값으로 사용
             current_q = self.joint_angles.copy()
             vprint(f"초기 조인트 각도: {current_q}")
+            if (current_q == np.zeros(6)).all():
+                initial_guess = None
+            else:
+                initial_guess = current_q
+
+
+            # Inverse Kinematics 계산 (it often outputs fail even though the target_pose and initial_guess are identical. Maybe due to its internal logic to consider singularities, workspace limits, etc.)
+            # success, q_forward = self.arm_interface._ctrlComp.armModel.inverseKinematics(
+            #     target_pose, current_q, True  # checkInWorkSpace=True
+            # )
+
+            # custom inverse kinematics
+            success, q_forward, error = self.solve_ik_multiple_guesses(target_pose, initial_guess=initial_guess, num_guesses=10, noise_std=0.3)
             
-            # Inverse Kinematics 계산
-            success, q_forward = self.arm_interface._ctrlComp.armModel.inverseKinematics(
-                target_pose, current_q, True  # checkInWorkSpace=True
-            )
-            
+            # 계산된 조인트 각도로 업데이트
+            self.joint_angles = q_forward
+            print(f'Custom IK error: {error:.6f}')
             vprint(f"계산 후 조인트 각도: {q_forward}")
             
             if success:
-                # 계산된 조인트 각도로 업데이트
-                self.joint_angles = q_forward
+                
                 vprint(f"Inverse Kinematics 성공: {self.joint_angles}")
                 
                 # Forward Kinematics로 검증
@@ -422,8 +836,10 @@ class Z1RobotVisualizer:
 
 # ========= 사용자 설정 =========
 # Zarr 데이터 경로 설정
-BUFFER_PATH = "/home/dscho1234/fast_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/single_marker_bottle_under_table_wilor"
-EPISODE_IDX = 7
+# BUFFER_PATH = "/home/dscho1234/fast_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/single_marker_bottle_under_table_v3"
+BUFFER_PATH = "/home/dscho1234/fast_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/single_marker_static_bottle_hamer"
+USE_DROID = False # True
+EPISODE_IDX = 0
 FRAME_IDX = 0  # 특정 프레임 선택
 DEPTH_SCALE = 0.001        # 깊이 단위 → 미터 변환 (예: mm면 0.001, 이미 m면 1.0)
 OFFSET_DISTANCE = 0.05 # for convex part of the constructed mesh
@@ -682,7 +1098,7 @@ def apply_fake_depth_to_mask(depths, mask, fake_value):
     
     return modified_depths
 
-def load_data_from_zarr(buffer_path, episode_idx):
+def load_data_from_zarr(buffer_path, episode_idx, droid=False):
     """Zarr에서 RGB와 depth 데이터를 불러오는 함수"""
     register_codecs()
     
@@ -701,8 +1117,10 @@ def load_data_from_zarr(buffer_path, episode_idx):
         group=episode["camera_0"],
         array_name="depth",
     )
-
-    T_mc_transformation = episode["T_mc_opt"][:].copy() # [T, 4, 4]
+    if droid:
+        T_mc_transformation = episode["T_mc_opt_droid"][:].copy() # [T, 4, 4]
+    else:
+        T_mc_transformation = episode["T_mc_opt"][:].copy() # [T, 4, 4]
     relative_poses = convert_to_relative(T_mc_transformation[None])[0] # [T, 4, 4]
 
     action = episode["action"][:].copy() # [T, 7]
@@ -1647,7 +2065,7 @@ def create_current_camera_pose_list(base_camera_pose, num_cameras=10):
     
     return current_camera_pose_list
 
-def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, depth_frames_wo_fake_depth_list, relative_poses_list, K_adjusted_list, T_mc_list, action_list, tracking_3d_list, robot_viz=None, voxel_size=0.01, image_size=None, follow_camera_view=False, active_camera=False, vis_window=True):
+def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, depth_frames_wo_fake_depth_list, relative_poses_list, K_adjusted_list, T_mc_list, action_list, tracking_3d_list, robot_viz=None, voxel_size=0.01, image_size=None, follow_camera_view=False, active_camera=False, vis_window=True, droid=False):
     """
     sun3d.py 방식을 차용한 nvblox 기반 multiframe 시각화 함수
     - Mapper를 한 번 생성하고 모든 프레임을 순차적으로 처리
@@ -1662,6 +2080,9 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, dept
     if num_frames == 0:
         print("No frames provided")
         return
+    
+    # Reward tracking 초기화
+    reward_tracker = RewardTracker()
     
     print(f"Processing {num_frames} frame(s) for nvblox multiframe visualization")
     
@@ -1689,8 +2110,10 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, dept
     
     
 
-    
-    video_path = os.path.join(save_path, "nvblox_visualization.mp4")
+    if droid:
+        video_path = os.path.join(save_path, "nvblox_visualization_droid.mp4")
+    else:
+        video_path = os.path.join(save_path, "nvblox_visualization.mp4")
     visualizer = CustomVisualizer(
         video_save=True,
         video_path=video_path,
@@ -1708,6 +2131,7 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, dept
         print("Camera following mode enabled - camera will follow each frame's pose")
 
     # 각 프레임을 순차적으로 처리 (sun3d.py 방식)
+    ik_success = False
     for frame_idx in range(num_frames):
         print(f"Processing frame {frame_idx + 1}/{num_frames}")
         start = time.time()
@@ -1742,19 +2166,16 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, dept
         
         
 
-        
-        robot_viz.set_joint_angles([0, 0, 0, 0, 0, 0])
-
         # dscho debug
         # NOTE: assume gripper_action is in [0 (open), 1 (close)]
         # [-1, 0] -> [-np.pi/2, 0]
         gripper_angle = (gripper_action-1)*np.pi/2 # unit : (radian)
         
         # Inverse Kinematics로 조인트 각도 계산
-        ik_success = robot_viz.solve_inverse_kinematics(action_se3, gripper_angle=gripper_angle)
+        ik_success = robot_viz.solve_inverse_kinematics(action_se3)
         robot_mesh_start = time.time()
         robot_meshes = robot_viz.get_robot_meshes_in_specified_transform(gripper_angle=gripper_angle, T_target=T_W_B) # np.linalg.inv(T_B_C)
-        print(f" IK success: {ik_success}, In multiframe example, Robot meshes time: {time.time() - robot_mesh_start:.4f} seconds")
+        print(f" IK : {ik_success}, In multiframe example, Robot meshes time: {time.time() - robot_mesh_start:.4f} seconds")
 
         
         # 3. 각 로봇 링크 메시를 결합
@@ -1958,6 +2379,22 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, dept
                 
         
         
+        # Reward tracking: 기존 카메라와 active 카메라의 visibility 결과를 reward로 저장
+        # 기존 카메라 reward (첫 번째 선택된 카메라의 결과)
+        reward_tracker.add_current_camera_reward(frame_idx, visibility_results)
+        
+        # Active 카메라 reward (첫 번째 선택된 active 카메라의 결과)
+        if 'active_visibility_results_dict' in locals() and active_visibility_results_dict is not None:
+            # 첫 번째 선택된 인덱스의 active 카메라 결과 사용
+            first_selected_idx = selected_indices[0] if selected_indices else 0
+            if first_selected_idx in active_visibility_results_dict:
+                active_visibility_results = active_visibility_results_dict[first_selected_idx]
+                reward_tracker.add_active_camera_reward(frame_idx, active_visibility_results)
+            else:
+                reward_tracker.add_active_camera_reward(frame_idx, None)
+        else:
+            reward_tracker.add_active_camera_reward(frame_idx, None)
+        
         visualizer.visualize(
             color_mesh=scene_mesh, 
             point_cloud=point_cloud,
@@ -1980,13 +2417,20 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, dept
         
     print(f'Saving mesh at {save_path}')
     mapper.update_color_mesh()
-    mapper.get_color_mesh().save(save_path+'/3d_visualization_animate_multiframe_nvblox.ply')
+    if droid:
+        mapper.get_color_mesh().save(save_path+'/3d_visualization_animate_multiframe_nvblox_droid.ply')
+    else:
+        mapper.get_color_mesh().save(save_path+'/3d_visualization_animate_multiframe_nvblox.ply')
     
     
     # 비디오 저장
     if visualizer.video_save and (len(visualizer.captured_frames_mesh) > 0 or len(visualizer.captured_frames_point_cloud) > 0):
         visualizer.save_video()
         print(f"Mesh frames: {len(visualizer.captured_frames_mesh)}, Point cloud frames: {len(visualizer.captured_frames_point_cloud)}")
+    
+    # Reward 분석 및 plot 생성
+    print("\n=== Generating Reward Analysis Plot ===")
+    reward_tracker.plot_reward_changes(save_path)
     
     
             
@@ -2068,7 +2512,7 @@ def main():
     # 1) 입력 로드
     vprint("\n=== 1. Loading RGB-D Data ===")
     load_start_time = time.time()
-    rgb_frames, depth_frames, relative_poses, combined_mask, T_mc_transformation, action, tracking_3d = load_data_from_zarr(BUFFER_PATH, EPISODE_IDX)
+    rgb_frames, depth_frames, relative_poses, combined_mask, T_mc_transformation, action, tracking_3d = load_data_from_zarr(BUFFER_PATH, EPISODE_IDX, USE_DROID)
     rgb, depth_raw, fake_depth_mask, relative_pose, T_mc, act, track_3d = get_data(rgb_frames, depth_frames, relative_poses, combined_mask, T_mc_transformation, action, tracking_3d, FRAME_IDX, DEPTH_SCALE)
     H, W = depth_raw.shape
     load_end_time = time.time()
@@ -2122,7 +2566,7 @@ def main():
 
     # Multi-frame scene mesh 애니메이션을 위한 RGB-D 데이터 로드
     vprint("\nLoading multiple frames for multiframe visualization...")
-    num_multiframe_frames = 250  # 디버깅을 위해 매우 적게 설정
+    num_multiframe_frames = 340  # 디버깅을 위해 매우 적게 설정
     rgb_frames_list = []
     depth_frames_list = []
     depth_frames_wo_fake_depth_list = []
@@ -2171,7 +2615,8 @@ def main():
             image_size=image_size,
             follow_camera_view=True,
             active_camera=True,  # active_camera 모드 활성화
-            vis_window=False,  # 윈도우 숨김 (비디오만 저장)
+            vis_window=True,  # 윈도우 숨김 (비디오만 저장)
+            droid=USE_DROID,
         )
         vprint("NVBlox multi-frame scene mesh animated visualization saved to: visibility_test_output/3d_visualization_animate_multiframe_nvblox.html")
     else:
