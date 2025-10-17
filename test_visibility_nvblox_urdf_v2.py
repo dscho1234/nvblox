@@ -556,15 +556,15 @@ class Z1RobotVisualizer:
             if initial_guess is not None and i == 0:
                 # First guess: use the provided initial_guess
                 guess = initial_guess.copy()
-            elif initial_guess is not None:
-                # Subsequent guesses: add noise around initial_guess
-                noise = np.random.normal(0, noise_std, 6)
-                guess = initial_guess + noise
+            # elif initial_guess is not None:
+            #     # Subsequent guesses: add noise around initial_guess
+            #     noise = np.random.normal(0, noise_std, 6)
+            #     guess = initial_guess + noise
                 
-                # Ensure the guess is within joint limits
-                guess = np.clip(guess, 
-                              [limit[0] for limit in self.joint_limits], 
-                              [limit[1] for limit in self.joint_limits])
+            #     # Ensure the guess is within joint limits
+            #     guess = np.clip(guess, 
+            #                   [limit[0] for limit in self.joint_limits], 
+            #                   [limit[1] for limit in self.joint_limits])
             else:
                 # No initial_guess provided: generate random guess within joint limits
                 guess = np.array([
@@ -579,6 +579,9 @@ class Z1RobotVisualizer:
                 best_error = error
                 best_q = q
                 best_success = True
+            
+            if error < 0.001:
+                break
         
         return best_success, best_q, best_error
     
@@ -629,6 +632,7 @@ class Z1RobotVisualizer:
             else:
                 initial_guess = current_q
 
+            
 
             # Inverse Kinematics 계산 (it often outputs fail even though the target_pose and initial_guess are identical. Maybe due to its internal logic to consider singularities, workspace limits, etc.)
             # success, q_forward = self.arm_interface._ctrlComp.armModel.inverseKinematics(
@@ -2181,7 +2185,7 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, dept
         # 3. 각 로봇 링크 메시를 결합
         for link_name, robot_mesh in robot_meshes.items():
             if robot_mesh is not None and len(robot_mesh.vertices) > 0:
-                scene_mesh += robot_mesh
+                scene_mesh = scene_mesh + robot_mesh
                 vprint(f"    Added robot link {link_name}: {len(robot_mesh.vertices)} vertices")
         
         if len(scene_mesh.vertices) == 0:
