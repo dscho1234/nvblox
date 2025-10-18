@@ -267,6 +267,23 @@ class RewardTracker:
         
         return plot_path
 
+
+# SO3 constraint null objective function
+class SO3Constraint:
+    def __init__(self, SO3_des=None):
+        if SO3_des is None:
+            # Default to identity matrix (no rotation preference)
+            self.SO3_des = np.eye(3)
+        else:
+            self.SO3_des = SO3_des.copy()
+    
+    def evaluate(self, SO3):
+        # SO3 error metric: 0.5 * (3 - trace(R * R_des^T))
+        # This measures the deviation from desired rotation
+        so3_err = 0.5 * (3 - np.trace(SO3 @ self.SO3_des.T))
+        return so3_err
+
+        
 # ========= Z1 Robot Visualizer Class =========
 class Z1RobotVisualizer:
     def __init__(self, urdf_path, mesh_base_path):
@@ -534,6 +551,117 @@ class Z1RobotVisualizer:
         else:
             return False, result.x, np.sqrt(result.fun)
     
+    def jacobian_position(self, q):
+        epsilon = 1e-6
+        epsilon_inv = 1/epsilon
+        T = self.arm_interface._ctrlComp.armModel.forwardKinematics(q, 6)
+        p = T[:3, 3]
+        jac = np.zeros([3, 6])
+        for i in range(6):
+            q_ = q.copy()
+            q_[i] = q_[i] + epsilon
+            T_ = self.arm_interface._ctrlComp.armModel.forwardKinematics(q_, 6)
+            p_ = T_[:3, 3]
+            jac[:, i] = (p_ - p)*epsilon_inv
+        return jac
+
+    def solve_ik_null_space(self, target_T, initial_guess=None, max_iterations=100, tolerance=1e-2, tolerance_null=1e-5, epsilon=1e-6):
+        """
+        Solve IK using pseudo-inverse with null-space approach.
+        
+        Args:
+            target_T: Target 4x4 transformation matrix
+            initial_guess: Initial joint angle guess
+            max_iterations: Maximum number of iterations
+            tolerance: Convergence tolerance for position error
+            tolerance_null: Convergence tolerance for null objective
+            epsilon: Small value for numerical differentiation
+            desired_rotation: 3x3 rotation matrix for null objective (default: identity)
+            
+        Returns:
+            tuple: (success, joint_angles, iterations, final_error)
+        """
+        if initial_guess is None:
+            initial_guess = np.zeros(6)
+        
+        
+        q = initial_guess.copy()
+        
+        
+        
+        # Initialize null objective with desired rotation (default: identity)
+        target_SO3 = target_T[:3, :3]
+        null_obj = SO3Constraint(target_SO3)
+        
+        iter_taken = 0
+
+        
+        
+        while True:
+            # Compute current forward kinematics
+            current_T = self.arm_interface._ctrlComp.armModel.forwardKinematics(q, 6)
+            
+            # Compute position error only (like in the original code)
+            pos_error = target_T[:3, 3] - current_T[:3, 3]
+            err = np.linalg.norm(pos_error)
+            
+            # Compute null objective value
+            current_SO3 = current_T[:3, :3]
+            null_obj_val = null_obj.evaluate(current_SO3)
+
+            # Compute Jacobian
+            # J = arm_model.CalcJacobian(q)
+            J = self.jacobian_position(q)
+            
+            # Check convergence: both position error and null objective must be satisfied
+            if (err < tolerance and null_obj_val < tolerance_null) or iter_taken >= max_iterations:
+                break
+            else:
+                iter_taken += 1
+            
+            
+            # Pseudo-inverse approach
+            
+            J_dagger = np.linalg.pinv(J)
+            J_null = np.eye(6) - J_dagger @ J  # null space of Jacobian
+            
+            # Compute null objective gradient using numerical differentiation
+            phi = np.zeros(6)
+            
+            for i in range(6):
+                q_perturb = q.copy()
+                q_perturb[i] += epsilon
+                # Apply joint limits to perturbed configuration
+                q_perturb = np.clip(q_perturb, [limit[0] for limit in self.joint_limits], [limit[1] for limit in self.joint_limits])
+                
+                
+                perturb_T = self.arm_interface._ctrlComp.armModel.forwardKinematics(q_perturb, 6)
+                perturb_SO3 = perturb_T[:3, :3]
+                null_obj_val_perturb = null_obj.evaluate(perturb_SO3)
+                phi[i] = (null_obj_val_perturb - null_obj_val) / epsilon
+            
+            
+            # Update using pseudo-inverse + null-space approach
+            # delta_x = ee_pos - x (position error)
+            delta_x = pos_error
+            delta_q = J_dagger @ delta_x - J_null @ phi
+            q = q + delta_q
+            
+            
+            # Apply joint limits
+            q = np.clip(q, [limit[0] for limit in self.joint_limits], [limit[1] for limit in self.joint_limits])
+        
+        # Final error check (position error only, like in original code)
+        current_T = self.arm_interface._ctrlComp.armModel.forwardKinematics(q, 6)
+        # final_pos_error = target_T[:3, 3] - current_T[:3, 3]
+        final_error = err # np.linalg.norm(final_pos_error)
+        
+        # Check if both conditions are satisfied for success
+        success = (final_error < tolerance and null_obj_val < tolerance_null)
+        
+        
+        return success, q, iter_taken, final_error, null_obj_val
+
     def solve_ik_multiple_guesses(self, target_T, initial_guess=None, num_guesses=10, noise_std=0.1):
         """
         Solve IK using multiple random initial guesses within joint limits.
@@ -640,21 +768,20 @@ class Z1RobotVisualizer:
             # )
 
             # custom inverse kinematics
-            success, q_forward, error = self.solve_ik_multiple_guesses(target_pose, initial_guess=initial_guess, num_guesses=10, noise_std=0.3)
+            # success, q_forward, error = self.solve_ik_multiple_guesses(target_pose, initial_guess=initial_guess, num_guesses=10, noise_std=0.3)
+            
+
+
+            # custom inverse kinematics v2
+            success, q_forward, iter_taken, error, null_obj_val = self.solve_ik_null_space(target_pose, initial_guess=initial_guess, max_iterations=20, tolerance=1e-2, tolerance_null=1e-4, epsilon=1e-6)
             
             # 계산된 조인트 각도로 업데이트
             self.joint_angles = q_forward
-            print(f'Custom IK error: {error:.6f}')
+            print(f'Custom IK iter: {iter_taken} error: {error:.6f} null_obj_val: {null_obj_val:.6f}')
             vprint(f"계산 후 조인트 각도: {q_forward}")
             
             if success:
-                
                 vprint(f"Inverse Kinematics 성공: {self.joint_angles}")
-                
-                # Forward Kinematics로 검증
-                fk_result = self.arm_interface._ctrlComp.armModel.forwardKinematics(q_forward, 6)
-                vprint(f"Forward Kinematics 검증 결과:\n{fk_result}")
-                
                 return True
             else:
                 vprint("Inverse Kinematics 실패: 목표 pose가 작업 공간 밖에 있습니다.")
@@ -841,8 +968,8 @@ class Z1RobotVisualizer:
 # ========= 사용자 설정 =========
 # Zarr 데이터 경로 설정
 # BUFFER_PATH = "/home/dscho1234/fast_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/single_marker_bottle_under_table_v3"
-BUFFER_PATH = "/home/dscho1234/fast_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/single_marker_static_bottle_hamer"
-USE_DROID = False # True
+BUFFER_PATH = "/home/dscho1234/fast_storage/dscho/im2flow2act/data/realworld_human_demonstration_custom/object_first/single_marker_static_bottle"
+USE_DROID = True
 EPISODE_IDX = 0
 FRAME_IDX = 0  # 특정 프레임 선택
 DEPTH_SCALE = 0.001        # 깊이 단위 → 미터 변환 (예: mm면 0.001, 이미 m면 1.0)
@@ -2176,10 +2303,12 @@ def create_multiframe_nvblox(save_path, rgb_frames_list, depth_frames_list, dept
         gripper_angle = (gripper_action-1)*np.pi/2 # unit : (radian)
         
         # Inverse Kinematics로 조인트 각도 계산
+        ik_start = time.time()
         ik_success = robot_viz.solve_inverse_kinematics(action_se3)
+        ik_time = time.time() - ik_start
         robot_mesh_start = time.time()
         robot_meshes = robot_viz.get_robot_meshes_in_specified_transform(gripper_angle=gripper_angle, T_target=T_W_B) # np.linalg.inv(T_B_C)
-        print(f" IK : {ik_success}, In multiframe example, Robot meshes time: {time.time() - robot_mesh_start:.4f} seconds")
+        print(f" IK : {ik_success}, In multiframe example, IK time: {ik_time:.4f} seconds, Robot meshes time: {time.time() - robot_mesh_start:.4f} seconds")
 
         
         # 3. 각 로봇 링크 메시를 결합
